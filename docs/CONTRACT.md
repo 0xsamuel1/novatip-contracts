@@ -54,6 +54,44 @@ struct Limits { bps_denom: u32, max_recipients: u32, max_message_len: u32 }
 | `get_token() -> Address` | — | The USDC token address tips settle in. |
 | `get_admin() -> Address` | — | The contract admin recorded at deploy time. |
 | `get_limits() -> Limits` | — | The bounds this contract enforces: `bps_denom`, `max_recipients`, `max_message_len`. Reads no storage. |
+The **Errors** column lists the `tip_splitter` error codes a call can return,
+**in the order the contract checks them** — only the first failure a call hits
+is reported, so the order tells a client what it will actually see. An error is
+written as raised only when every earlier check has passed.
+
+| Function | Auth | Errors (in check order) | Description |
+|----------|------|-------------------------|-------------|
+| `__constructor(admin, token)` | — | — | Deploy-time init. Stores the admin and USDC token address. |
+| `create_jar(owner, jar_id, splits)` | `owner` | `InvalidJarId` → `JarExists` → `SplitsEmpty` → `TooManyRecipients` → `SplitOutOfRange` / `DuplicateRecipient` (per entry) → `SplitSumNot100Pct` | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. |
+| `update_splits(jar_id, splits)` | jar `owner` | `JarNotFound` → `SplitsEmpty` → `TooManyRecipients` → `SplitOutOfRange` / `DuplicateRecipient` (per entry) → `SplitSumNot100Pct` | Replace a jar's splits. Subject to the same validation as `create_jar`. Emits a `splits` event. |
+| `set_min_tip_amount(jar_id, min_amount)` | jar `owner` | `JarNotFound` → `InvalidAmount` | Set or clear an optional minimum tip amount for a jar. `min_amount` must be strictly positive (`> 0`) or `None` to clear. Emits a `min_tip` event. |
+| `transfer_jar_ownership(jar_id, new_owner)` | current jar `owner` | `JarNotFound` | Hand control of a jar to `new_owner`. Splits are unchanged; the new owner does not need to authorize. Emits a `jar_xfer` event carrying both owners. |
+| `tip(from, jar_id, amount, message)` | `from` | `InvalidAmount` (amount ≤ 0) → `MessageTooLong` → `JarNotFound` → `BelowMinTipAmount` → `NotInitialized` → `InvalidAmount` (a share truncates to zero, or `amount * bps` overflows `i128`) | Transfer `amount` USDC from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. A failing token `transfer` reverts the whole call with the **token contract's own error**, not one of this contract's codes (e.g. an insufficient balance). |
+| `get_jar(jar_id) -> Jar` | — | `JarNotFound` | Read a jar's configuration. Panics with `JarNotFound` if the slug is free. |
+| `get_jar_owner(jar_id) -> Address` | — | `JarNotFound` | Read just a jar's owner. Panics with `JarNotFound` if the slug is free. |
+| `get_split_count(jar_id) -> u32` | — | `JarNotFound` | How many recipients a jar pays. Panics with `JarNotFound` if the slug is free. |
+| `preview_split(jar_id, amount) -> Vec<i128>` | — | `JarNotFound` → `BelowMinTipAmount` → `InvalidAmount` | What each recipient would receive from a tip of `amount`, in split order. Rejects amounts below the jar's minimum with `BelowMinTipAmount` as well as the amounts `tip` rejects; panics with `JarNotFound` if the slug is free. |
+| `jar_exists(jar_id) -> bool` | — | — | Whether the slug is already registered. Reads one key and returns a plain `bool`; never panics on a free slug. |
+| `is_recipient(jar_id, address) -> bool` | — | `JarNotFound` | Whether `address` appears in the jar's splits. Panics with `JarNotFound` if the slug is free. |
+| `get_min_tip_amount(jar_id) -> Option<i128>` | — | `JarNotFound` | Read a jar's optional minimum tip amount. Returns `None` if no minimum is set. Panics with `JarNotFound` if the slug is free. |
+| `get_token() -> Address` | — | `NotInitialized` | The USDC token address tips settle in. Reads instance storage; `NotInitialized` if the deploy-time token is absent. |
+| `get_admin() -> Address` | — | `NotInitialized` | The contract admin recorded at deploy time. Reads instance storage; `NotInitialized` if the deploy-time admin is absent. |
+| `get_limits() -> Limits` | — | — | The bounds this contract enforces: `bps_denom`, `max_recipients`, `max_message_len`. Reads no storage. |
+
+Two ordering notes that are easy to get wrong:
+
+- **Auth is not a contract error code.** A call that lacks the required
+  signature fails with Soroban's authorization error, not a `tip_splitter`
+  variant. The owner-only setters (`update_splits`, `set_min_tip_amount`,
+  `transfer_jar_ownership`) look the jar up *before* requiring the owner's
+  signature, so an unauthenticated caller using a free slug sees `JarNotFound`,
+  not an auth failure. `create_jar` requires the declared owner's signature
+  first.
+- **`tip` checks the message length before it looks up the jar**, so an
+  over-long message to an unregistered slug reports `MessageTooLong`, not
+  `JarNotFound`. Likewise `validate_splits` checks each entry's `bps` range
+  before scanning for that entry's duplicates, so
+  `[{to: a, bps: 0}, {to: a, bps: 10_000}]` reports `SplitOutOfRange`.
 
 ### Confirming you are a recipient
 
@@ -110,10 +148,16 @@ and cache it for the session.
 [Message](#concepts) above. A client showing a remaining-characters indicator
 must count UTF-8 bytes against this number, not `message.length`.
 
-A test asserts the returned values equal the constants, so the view and the
-enforcement cannot drift apart. The current values are also asserted
-literally, which means changing a bound fails the suite until this document is
-updated with it.
+A test asserts the returned values equal the constants (`get_limits_matches_
+contract_constants` in `test.rs`), so the view and the enforcement cannot drift
+apart. The current values are also asserted literally, which means changing a
+bound fails the suite until the constants are updated with it. The document
+you are reading is checked too: `scripts/check-docs.sh` (`make check-docs`,
+and a CI step) builds the contract, reads its public interface out of the
+built wasm, and fails when the Functions table above or the Errors table
+below no longer matches the contract — a function or error variant missing
+from either table, listed there although the contract does not have it, or
+documented with a different error number.
 
 ### Reading just the owner
 
@@ -230,12 +274,12 @@ and could produce jars no frontend can address. The bound is inclusive: a
 
 `create_jar` and `update_splits` share one validator, so both enforce all of:
 
-- The list must be non-empty — `InvalidSplits`.
+- The list must be non-empty — `SplitsEmpty`.
 - At most 20 entries (`MAX_RECIPIENTS`) — `TooManyRecipients`.
-- **No entry may have `bps == 0`** — `InvalidSplits`.
+- **No entry may have `bps == 0`** — `SplitOutOfRange`.
 - **No address may appear twice** — `DuplicateRecipient`.
-- **No entry may have `bps > 10_000`** — `InvalidSplits`.
-- The `bps` values must sum to exactly `10_000` — `InvalidSplits`.
+- **No entry may have `bps > 10_000`** — `SplitOutOfRange`.
+- The `bps` values must sum to exactly `10_000` — `SplitSumNot100Pct`.
 
 A `bps == 0` entry is rejected rather than accepted-and-ignored. Such a
 recipient could never be paid (`tip` skips zero shares), but it would still
@@ -262,7 +306,7 @@ to a set summing to 100% — the sum check would reject it anyway. It is rejecte
 per entry because that also bounds the running total: with at most 20 entries
 of at most `10_000` each, the accumulator can never exceed `200_000`, far below
 `u32::MAX`. The sum is additionally accumulated with `checked_add`, which fails
-with `InvalidSplits` rather than trapping.
+with `SplitSumNot100Pct` rather than trapping.
 
 This matters because `bps` is caller-supplied and unbounded in the wire type.
 Before, a set of shares whose true sum exceeded `u32::MAX` relied on
@@ -350,11 +394,11 @@ slug names at submission time.
 
 | Code | Name | Cause |
 |------|------|-------|
-| 1 | `NotInitialized` | Token address missing (should never happen post-deploy). |
+| 1 | `NotInitialized` | A deploy-time value is missing from instance storage: the USDC token address (raised by `get_token` and by `tip`) or the admin (raised by `get_admin`). Should never happen post-deploy. |
 | 2 | `JarExists` | Slug already registered. |
 | 3 | `JarNotFound` | Slug not registered. |
 | 4 | `InvalidSplits` | **No longer raised.** Split validation now reports the specific failure as code 10, 11 or 12. The variant is retained so existing codes keep their values. |
-| 5 | `InvalidAmount` | Tip amount ≤ 0, small enough that some recipient's share would truncate to zero, or so large that `amount * bps` overflows `i128` before the division. Raised by `tip` and by `preview_split`. |
+| 5 | `InvalidAmount` | Amount ≤ 0, small enough that some recipient's share would truncate to zero, or so large that `amount * bps` overflows `i128` before the division. Raised by `tip` and `preview_split` (over the tip amount) and by `set_min_tip_amount` (for a non-positive minimum). |
 | 6 | `TooManyRecipients` | More than 20 recipients. |
 | 7 | `DuplicateRecipient` | The same address appears more than once in the splits. |
 | 8 | `MessageTooLong` | Tip message exceeds 280 bytes. |
@@ -363,11 +407,44 @@ slug names at submission time.
 | 11 | `SplitOutOfRange` | An entry has `bps == 0` or `bps > 10_000`. Checked per entry, before the sum. |
 | 12 | `SplitSumNot100Pct` | The shares sum to something other than exactly 10 000 bps, including a sum that would overflow `u32`. |
 | 13 | `BelowMinTipAmount` | Tip amount is strictly below the jar's configured minimum tip amount. Raised by `tip` and `preview_split`. |
+| 14 | `InsufficientBalance` | Tip amount exceeds the sender's USDC balance. Checked once per `tip`, before any transfer. |
 
 Error codes are part of the public interface: `@novatip/sdk` and the frontend
 both map these numbers to user-facing messages. New variants are **appended**
 and existing values are never renumbered, which is why code 4 stays in place
 rather than being removed.
+
+### Token failures keep the token's own code
+
+`tip` moves funds with the USDC Stellar Asset Contract's `transfer`. When that
+call fails for a reason other than an empty wallet, the token's error
+propagates unchanged — and the SAC numbers its errors from 1 just like this
+contract does, so the numbers overlap:
+
+| SAC code | SAC meaning | Collides with this contract's |
+|----------|-------------|-------------------------------|
+| 10 (`BalanceError`) | balance too low to spend (also: resulting balance too low/high, clawback on a non-clawback trustline) | 10 `SplitsEmpty` |
+| 11 (`BalanceDeauthorizedError`) | balance authorization revoked (frozen) by the issuer | 11 `SplitOutOfRange` |
+| 12 (`OverflowError`) | spender allowance would overflow | 12 `SplitSumNot100Pct` |
+| 13 (`TrustlineMissingError`) | trustline entry missing for the account | 13 `BelowMinTipAmount` |
+
+(The SAC also uses 3, 6, 8 and 9, which likewise coincide with this
+contract's codes of the same numbers.)
+
+The one exception is the empty wallet: `tip` reads the sender's token
+`balance` once, before the first transfer, and fails with the contract's own
+code 14 `InsufficientBalance` when `balance < amount`. A tip larger than the
+sender's balance therefore never reaches the token, so it can never be
+mislabelled as "Add at least one collaborator".
+
+Any other token failure — a missing trustline on either end, a frozen
+(deauthorized) trustline, an unauthorized or overflowing allowance — still
+surfaces with the token's number. **Clients must check which contract raised
+the error before mapping the number to a message.** On failure the diagnostic
+events name the failing contract (the SAC's contract id vs this contract's
+id); only errors raised by `tip_splitter` itself may be looked up in the table
+above. A bare `Error(Contract, #10)` with no source is ambiguous between
+`SplitsEmpty` and the SAC's `BalanceError`.
 
 ## Events
 
@@ -529,11 +606,12 @@ unchanged and remains the positional call the SDK and the web tip form use.
 > four by appending `breakdown`; that wording describes the `breakdown` addition
 > and is kept for the migration note.
 
-## Jar discovery — design decision
+## Jar discovery — design note
 
-The previous contract exposed a `get_jar_ids() -> Vec<String>` view backed by
-an instance-storage vector that grew by one entry on every `create_jar` call.
-This had two problems:
+Indexing needs a way to enumerate every registered jar. An earlier design kept
+that list on-chain as a `get_jar_ids() -> Vec<String>` view backed by an
+instance-storage vector that grew by one entry on every `create_jar`. It had
+two problems:
 
 1. **Unbounded growth.** The vector had no removal path and no size cap, so it
    grew permanently with every jar ever created.
@@ -542,31 +620,43 @@ This had two problems:
    last, and the entry would eventually approach the ledger entry size limit,
    causing `create_jar` to fail for all callers.
 
-**Decision:** drop the on-chain list entirely and move discovery to the event
-log. `create_jar` now emits a `jar_crtd` event carrying the `jar_id` and
-`owner`. Indexers reconstruct the full jar list by scanning those events from
-ledger 0 (or from their last checkpoint). This is the standard pattern for
-Soroban contracts where enumeration is needed but unbounded on-chain state is
-not acceptable.
+**Decision — the design in use today:** keep no on-chain list and move discovery
+to the event log. `create_jar` emits a `jar_crtd` event carrying the `jar_id`
+and `owner`; indexers reconstruct the full jar list by scanning those events
+from the contract's creation ledger (or from their last checkpoint). This is the
+standard pattern for Soroban contracts where enumeration is needed but unbounded
+on-chain state is not acceptable, and it keeps `create_jar` cost O(1) regardless
+of how many jars exist.
 
-### Migration impact for the backend indexer
+### History, not instructions: this was never a `get_jar_ids` migration
 
-- **`get_jar_ids` is removed.** Any indexer code that calls this function must
-  be updated.
-- **Backfill required.** On first deploy of this version, the indexer must
-  replay all historical `jar_crtd` events from the contract's creation ledger
-  to reconstruct the jar list. If the previous contract was deployed with the
-  old version, existing jars will not have emitted `jar_crtd` events. Those
-  jars must be seeded into the indexer's database from the old `get_jar_ids`
-  response before upgrading, or discovered by replaying `create_jar`
-  invocation history from Horizon.
-- **Going forward,** every new jar emits `jar_crtd`, so no polling or
-  `get_jar_ids` calls are needed.
+The `get_jar_ids` view and its backing vector were **added and removed within a
+single unreleased cycle** (see `CHANGELOG.md`), so no published build ever
+exposed the function — there is nothing to migrate off or seed from. `v0.1.0`
+ships only `__constructor`, `create_jar`, `update_splits`, `tip`, `get_jar` and
+`get_token`.
+
+The real gap is event coverage, not a removed function. `jar_crtd` is emitted
+only by builds **after** `v0.1.0`:
+
+- A deployment built from `v0.1.0` never emitted `jar_crtd` at all, so the jars
+  it created are absent from the event log. The testnet contract referenced in
+  the README predates the current event payloads as well.
+- To find jars created on such a deployment, replay its `create_jar`
+  invocations from Horizon (Soroban transaction history), or seed them from an
+  off-chain snapshot — not from a `get_jar_ids` response, which no deployment
+  has ever returned.
+
+Every jar created by a build that emits `jar_crtd` needs no special handling:
+scanning the event log from the contract's creation ledger is enough.
 
 ## Deploy & bootstrap
 
+The scripts load `.env` from the repository root themselves — exported
+variables win over `.env`, and no manual `source` step is needed. They work
+when started from any directory.
+
 ```bash
-set -a; source .env; set +a
 ./scripts/deploy.sh        # deploys, writes .contract-id
 ./scripts/create-jar.sh    # registers an example jar
 ./scripts/set-min-tip.sh   # sets (or clears) a jar's minimum tip
@@ -576,3 +666,81 @@ set -a; source .env; set +a
 See [`.env.example`](../.env.example) for required variables, and the
 [README's scripts section](../README.md#scripts) for what each script needs and
 how `MIN_TIP=none` reaches `Option::None`.
+Once a jar exists:
+
+```bash
+./scripts/jar-info.sh                      # read-only: owner, recipients, minimum tip
+AMOUNT=100000 ./scripts/jar-info.sh        # ... plus what a tip of that size pays each recipient
+./scripts/update-splits.sh                 # replace a jar's splits (signed by the jar owner)
+SPLITS='[{"to":"G...A","bps":7000},{"to":"G...B","bps":3000}]' ./scripts/update-splits.sh
+```
+
+`jar-info.sh` only simulates — it submits no transactions and pays no fee, and
+any `SOURCE` identity works. `update-splits.sh` validates the new splits with
+the same checks as `create-jar.sh` (both share `scripts/lib/splits.sh`), prints
+the old and new splits side by side, refuses to send when they are unchanged,
+and requires `SOURCE` to be the jar's owner before invoking `update_splits`.
+
+See [`.env.example`](../.env.example) for required variables.
+
+### USDC trustlines
+
+Every classic `G...` account that sends **or receives** a tip needs a trustline
+to the settlement asset first, and tips are all-or-nothing — one recipient
+without a line fails the whole tip with the token's `Error(Contract, #13)`.
+`scripts/trustline.sh` adds the line for the identities in `IDENTITIES`,
+deriving the classic asset (`USDC:<issuer>`) from `USDC_TOKEN` itself, and
+skips accounts that already have one. With `SLUG` set it also checks the jar's
+recipients; `--check` reports without changing anything and exits non-zero if
+anyone cannot be paid:
+
+```bash
+IDENTITIES="tipper alice bob" ./scripts/trustline.sh          # add lines
+SLUG=@demo ./scripts/trustline.sh --check                     # report only
+```
+
+Testnet USDC is issued by the account encoded in the derived asset name
+(`USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`
+on testnet). There is no on-chain claim — fund an account by payment from a
+holder (see the usage comment at the top of `scripts/trustline.sh`), after
+`stellar fund` covers the XLM reserves.
+
+### Inspecting events
+
+When an indexer misses something, the first question is whether the event was
+ever emitted. `scripts/events.sh` computes the topic filters with
+`stellar xdr encode --type ScVal` instead of hand-rolled base64 (a wrong
+encoding fails loudly, a wrong segment count silently returns nothing — see
+the encoding walkthrough in the issues thread #57):
+
+```bash
+EVENT=tip SLUG=@demo ./scripts/events.sh   # tips to one jar
+EVENT=all ./scripts/events.sh              # every event type, recent window
+```
+
+It lists each of the five event types (`jar_crtd`, `splits`, `jar_xfer`,
+`min_tip`, `tip`), one line per event with ledger, name, jar id and decoded
+payload, defaulting to a recent ledger window; a `START_LEDGER` outside the
+RPC's retention window gets an explanatory error. Sample output is in the
+script's usage comment.
+
+## Calling from another contract
+
+`tip` authorizes `from` with `from.require_auth()`, which a calling contract
+satisfies automatically — but the per-recipient `transfer(from, …)` calls it
+then makes are invoked by `tip_splitter`, not by the caller, so they are not
+covered. A contract tipping from its own balance must pre-authorize each
+transfer with `env.authorize_as_current_contract`, listing every recipient and
+the exact amount, or the tip fails with an auth error.
+
+The amounts to authorize are what `preview_split(jar_id, amount)` returns, with
+one exception: if the calling contract is itself a recipient, `tip` skips the
+self-transfer and rolls that share into the last recipient, so authorize
+`preview_split`'s values **minus** the contract's own entry, plus the same
+amount on the final recipient.
+
+`examples/tip-forwarder` is a worked example of exactly this — one function
+that tips a jar from the contract's own balance — with tests that run it
+against the real `TipSplitter` and a test SAC, including the failure mode where
+the authorized amounts do not match the jar's splits. See its
+[`README.md`](../examples/tip-forwarder/README.md).

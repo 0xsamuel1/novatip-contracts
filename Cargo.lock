@@ -1691,6 +1691,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tip-forwarder"
+version = "0.0.0"
+dependencies = [
+ "soroban-sdk",
+ "tip-splitter",
+]
+
+[[package]]
 name = "tip-splitter"
 version = "0.1.0"
 dependencies = [

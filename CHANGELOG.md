@@ -35,6 +35,58 @@ All notable changes to `novatip-contracts` are documented here.
   that the client's recovery is to re-simulate and re-sign rather than retry
 
 ### Changed (breaking: event payload)
+- `scripts/update-splits.sh` replaces a jar's splits with the same local
+  validation `create-jar.sh` applies (both now share `scripts/lib/splits.sh`).
+  It prints the old and new splits before sending, refuses unchanged splits,
+  and refuses to sign when `SOURCE` is not the jar's owner
+- `scripts/jar-info.sh`, a read-only inspector: owner, each recipient with its
+  share as a percentage, the minimum tip, and — with `AMOUNT` set — what a tip
+  of that size pays each recipient (`preview_split`). It submits nothing
+- `scripts/check-docs.sh` (`make check-docs`, CI step `docs-check`) builds the
+  contract and fails when `docs/CONTRACT.md`'s function or error tables no
+  longer match the built interface — missing or extra entries, or an error
+  documented with a different number
+- `scripts/lib/env.sh`, sourced by every script: loads the repository-root
+  `.env` (exported variables win), cds to the repo root so scripts work from
+  any directory, and reports missing settings by name
+
+### Changed
+- `make deploy` and `scripts/*.sh` no longer require a manual
+  `set -a; source .env; set +a`; `.env.example` documents the optional
+  `CONTRACT_ID` override and the testnet/mainnet USDC SAC ids
+
+### Added
+- `scripts/events.sh` lists the contract's published events with topic filters
+  computed via `stellar xdr encode --type ScVal` instead of hand-encoded
+  base64. Takes `EVENT` (one of the five event names or `all`), optional
+  `SLUG`, and an optional ledger window, and explains the RPC's event
+  retention when a start ledger is too old
+- `scripts/trustline.sh` adds the USDC trustline every classic account needs
+  to tip or receive tips, deriving the classic `CODE:ISSUER` line from
+  `USDC_TOKEN`'s own `name()`. Idempotent (accounts that already have the
+  line are skipped); `--check` with `SLUG` reports a jar's recipients that
+  cannot receive a tip and exits non-zero. Its usage comment and
+  `docs/CONTRACT.md` explain where testnet USDC comes from
+- `examples/tip-forwarder`: a worked example of `tip_splitter` called from
+  another contract — the caller must pre-authorize each per-recipient
+  `transfer` with `env.authorize_as_current_contract`, and the amounts differ
+  from `preview_split` when the caller is itself a recipient. Tests run the
+  real `TipSplitter` and a test SAC under strict `mock_auths`; the interface
+  is declared with a local `#[contractclient]` so `cargo test` needs no built
+  wasm
+- `.github/`: issue forms (`bug_report.yml` requiring network, contract id,
+  CLI version, command and full output; `feature_request.yml`), `config.yml`
+  disabling blank issues and routing security reports to the private channel,
+  and a pull request template with interface/changelog/consumer-impact
+  checks
+- `docs/CONTRACT.md` gains "Calling from another contract", "USDC
+  trustlines" and "Inspecting events" sections
+- `InsufficientBalance` (code 14, appended so existing codes are unchanged).
+  `tip` reads the sender's token balance once before the first transfer and
+  fails with this code when `balance < amount`, instead of letting the SAC's
+  overlapping `BalanceError` (code 10) propagate as `SplitsEmpty`. Other token
+  failures (missing or frozen trustline, allowance overflow) still surface
+  with the token's own number — see `docs/CONTRACT.md`
 - `get_limits() -> Limits` returns `bps_denom`, `max_recipients` and
   `max_message_len`, so clients read the bounds from the contract they are
   talking to instead of hardcoding their own copy
@@ -152,7 +204,8 @@ All notable changes to `novatip-contracts` are documented here.
   this unreleased cycle, so never shipped in a release — are gone: the vector
   grew without bound and made each `create_jar` cost more than the last.
   Indexers reconstruct the jar list by scanning `jar_crtd` events; see
-  [`docs/CONTRACT.md`](docs/CONTRACT.md) for the backfill procedure.
+  [`docs/CONTRACT.md`](docs/CONTRACT.md) for how discovery works and how to find
+  jars created before a build emitted `jar_crtd`.
 - `validate_splits()` now rejects any split with `bps == 0` (`InvalidSplits`).
   Such a recipient could never be paid but still consumed one of the 20
   recipient slots and appeared in clients as a collaborator. This applies to

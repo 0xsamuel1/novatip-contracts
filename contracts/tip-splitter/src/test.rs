@@ -1705,6 +1705,24 @@ fn tip_on_missing_jar_fails() {
     assert_eq!(res, Err(Ok(Error::JarNotFound.into())));
 }
 
+/// Backs the check-order claim in `docs/CONTRACT.md`: `tip` rejects an
+/// over-long message before it looks the jar up, so an over-long message to an
+/// unregistered slug reports `MessageTooLong`, not `JarNotFound`. Both
+/// conditions are true here — the amount is valid and the jar is missing — so
+/// only the earlier message-length guard can explain the reported code.
+#[test]
+fn tip_rejects_over_long_message_before_jar_lookup() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let tipper = Address::generate(env);
+    // One byte over MAX_MESSAGE_LEN (280), sent to a slug that was never registered.
+    let too_long = String::from_bytes(env, &[b'a'; 281]);
+    let res = client.try_tip(&tipper, &String::from_str(env, "@ghost"), &100, &too_long);
+    assert_eq!(res, Err(Ok(Error::MessageTooLong.into())));
+}
+
 /// `update_splits` runs the same lookup-then-panic path as `tip`, so an
 /// unregistered slug must be rejected rather than quietly creating a jar.
 #[test]
@@ -2064,7 +2082,7 @@ fn tip_fails_when_sender_has_insufficient_balance() {
     client.create_jar(&owner, &jar_id, &splits);
 
     let res = client.try_tip(&tipper, &jar_id, &100, &String::from_str(env, "oops"));
-    assert!(res.is_err());
+    assert_eq!(res, Err(Ok(Error::InsufficientBalance.into())));
 
     // Balances must be unchanged — tipper keeps their 50, alice gets nothing.
     assert_eq!(token.balance(&tipper), 50);
@@ -2119,8 +2137,9 @@ fn tip_multi_recipient_no_partial_distribution_on_insufficient_balance() {
         &String::from_str(env, "not enough"),
     );
 
-    // The call must fail.
-    assert!(res.is_err());
+    // The call must fail with the contract's own insufficient-balance code,
+    // not the token's overlapping number.
+    assert_eq!(res, Err(Ok(Error::InsufficientBalance.into())));
 
     // Atomicity: every recipient balance must still be 0 — no partial payment.
     assert_eq!(

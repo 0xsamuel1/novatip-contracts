@@ -85,7 +85,9 @@ const JAR_TTL_THRESHOLD: u32 = 500_000;
 #[contracttype]
 #[derive(Clone)]
 pub struct Split {
+    /// Recipient that receives this share of every tip.
     pub to: Address,
+    /// Share of each tip in basis points, out of 10 000; a jar's splits sum to exactly 10 000.
     pub bps: u32,
 }
 
@@ -93,7 +95,9 @@ pub struct Split {
 #[contracttype]
 #[derive(Clone)]
 pub struct Jar {
+    /// Address that may change the jar — its splits, ownership, and minimum tip amount.
     pub owner: Address,
+    /// The recipients a tip is split across, and the share each one receives.
     pub splits: Vec<Split>,
 }
 
@@ -150,6 +154,8 @@ pub enum Error {
     SplitSumNot100Pct = 12,
     /// Tip amount is below the jar's configured minimum tip amount.
     BelowMinTipAmount = 13,
+    /// Tip amount exceeds the sender's USDC balance.
+    InsufficientBalance = 14,
 }
 
 #[contract]
@@ -388,6 +394,15 @@ impl TipSplitter {
         // One shared calculation with `preview_split`, so the number a client
         // shows before signing is the number paid out here.
         let shares = Self::compute_shares(&env, &jar.splits, amount);
+
+        // Fail fast with the contract's own code when the sender cannot cover
+        // the full tip. Without this, the token's transfer failure propagates
+        // with the SAC's own number (10/11/13), which collides with ours —
+        // an empty wallet would surface as `SplitsEmpty`. Checked once, before
+        // any transfer, so a failed tip never moves partial funds.
+        if client.balance(&from) < amount {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
 
         let mut skipped: i128 = 0;
         // The per-recipient breakdown published in the `tip` event, in split
