@@ -5,6 +5,31 @@ All notable changes to `novatip-contracts` are documented here.
 ## [Unreleased]
 
 ### Added
+- `scripts/events.sh` lists the contract's published events with topic filters
+  computed via `stellar xdr encode --type ScVal` instead of hand-encoded
+  base64. Takes `EVENT` (one of the five event names or `all`), optional
+  `SLUG`, and an optional ledger window, and explains the RPC's event
+  retention when a start ledger is too old
+- `scripts/trustline.sh` adds the USDC trustline every classic account needs
+  to tip or receive tips, deriving the classic `CODE:ISSUER` line from
+  `USDC_TOKEN`'s own `name()`. Idempotent (accounts that already have the
+  line are skipped); `--check` with `SLUG` reports a jar's recipients that
+  cannot receive a tip and exits non-zero. Its usage comment and
+  `docs/CONTRACT.md` explain where testnet USDC comes from
+- `examples/tip-forwarder`: a worked example of `tip_splitter` called from
+  another contract — the caller must pre-authorize each per-recipient
+  `transfer` with `env.authorize_as_current_contract`, and the amounts differ
+  from `preview_split` when the caller is itself a recipient. Tests run the
+  real `TipSplitter` and a test SAC under strict `mock_auths`; the interface
+  is declared with a local `#[contractclient]` so `cargo test` needs no built
+  wasm
+- `.github/`: issue forms (`bug_report.yml` requiring network, contract id,
+  CLI version, command and full output; `feature_request.yml`), `config.yml`
+  disabling blank issues and routing security reports to the private channel,
+  and a pull request template with interface/changelog/consumer-impact
+  checks
+- `docs/CONTRACT.md` gains "Calling from another contract", "USDC
+  trustlines" and "Inspecting events" sections
 - `get_limits() -> Limits` returns `bps_denom`, `max_recipients` and
   `max_message_len`, so clients read the bounds from the contract they are
   talking to instead of hardcoding their own copy
