@@ -28,13 +28,16 @@ make build
 
 ## Before you push
 
-CI runs exactly these, so run them locally first:
+Run everything CI checks with one command:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+make ci
 ```
+
+It runs the format check, clippy, tests, the release wasm build and the wasm
+size check, in the same order with the same flags as CI. See
+[RELEASING.md](./RELEASING.md) for how a contract release is versioned,
+tagged and deployed.
 
 ## Opening a pull request
 

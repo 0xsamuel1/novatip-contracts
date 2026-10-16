@@ -5,6 +5,12 @@ All notable changes to `novatip-contracts` are documented here.
 ## [Unreleased]
 
 ### Added
+- `InsufficientBalance` (code 14, appended so existing codes are unchanged).
+  `tip` reads the sender's token balance once before the first transfer and
+  fails with this code when `balance < amount`, instead of letting the SAC's
+  overlapping `BalanceError` (code 10) propagate as `SplitsEmpty`. Other token
+  failures (missing or frozen trustline, allowance overflow) still surface
+  with the token's own number — see `docs/CONTRACT.md`
 - `get_limits() -> Limits` returns `bps_denom`, `max_recipients` and
   `max_message_len`, so clients read the bounds from the contract they are
   talking to instead of hardcoding their own copy

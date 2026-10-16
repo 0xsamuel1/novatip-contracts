@@ -1713,7 +1713,7 @@ fn tip_fails_when_sender_has_insufficient_balance() {
     client.create_jar(&owner, &jar_id, &splits);
 
     let res = client.try_tip(&tipper, &jar_id, &100, &String::from_str(env, "oops"));
-    assert!(res.is_err());
+    assert_eq!(res, Err(Ok(Error::InsufficientBalance.into())));
 
     // Balances must be unchanged — tipper keeps their 50, alice gets nothing.
     assert_eq!(token.balance(&tipper), 50);
@@ -1768,8 +1768,9 @@ fn tip_multi_recipient_no_partial_distribution_on_insufficient_balance() {
         &String::from_str(env, "not enough"),
     );
 
-    // The call must fail.
-    assert!(res.is_err());
+    // The call must fail with the contract's own insufficient-balance code,
+    // not the token's overlapping number.
+    assert_eq!(res, Err(Ok(Error::InsufficientBalance.into())));
 
     // Atomicity: every recipient balance must still be 0 — no partial payment.
     assert_eq!(
