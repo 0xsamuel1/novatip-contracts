@@ -292,11 +292,44 @@ the code, so flipping that profile setting cannot turn it into a bypass.
 | 11 | `SplitOutOfRange` | An entry has `bps == 0` or `bps > 10_000`. Checked per entry, before the sum. |
 | 12 | `SplitSumNot100Pct` | The shares sum to something other than exactly 10 000 bps, including a sum that would overflow `u32`. |
 | 13 | `BelowMinTipAmount` | Tip amount is strictly below the jar's configured minimum tip amount. Raised by `tip` and `preview_split`. |
+| 14 | `InsufficientBalance` | Tip amount exceeds the sender's USDC balance. Checked once per `tip`, before any transfer. |
 
 Error codes are part of the public interface: `@novatip/sdk` and the frontend
 both map these numbers to user-facing messages. New variants are **appended**
 and existing values are never renumbered, which is why code 4 stays in place
 rather than being removed.
+
+### Token failures keep the token's own code
+
+`tip` moves funds with the USDC Stellar Asset Contract's `transfer`. When that
+call fails for a reason other than an empty wallet, the token's error
+propagates unchanged — and the SAC numbers its errors from 1 just like this
+contract does, so the numbers overlap:
+
+| SAC code | SAC meaning | Collides with this contract's |
+|----------|-------------|-------------------------------|
+| 10 (`BalanceError`) | balance too low to spend (also: resulting balance too low/high, clawback on a non-clawback trustline) | 10 `SplitsEmpty` |
+| 11 (`BalanceDeauthorizedError`) | balance authorization revoked (frozen) by the issuer | 11 `SplitOutOfRange` |
+| 12 (`OverflowError`) | spender allowance would overflow | 12 `SplitSumNot100Pct` |
+| 13 (`TrustlineMissingError`) | trustline entry missing for the account | 13 `BelowMinTipAmount` |
+
+(The SAC also uses 3, 6, 8 and 9, which likewise coincide with this
+contract's codes of the same numbers.)
+
+The one exception is the empty wallet: `tip` reads the sender's token
+`balance` once, before the first transfer, and fails with the contract's own
+code 14 `InsufficientBalance` when `balance < amount`. A tip larger than the
+sender's balance therefore never reaches the token, so it can never be
+mislabelled as "Add at least one collaborator".
+
+Any other token failure — a missing trustline on either end, a frozen
+(deauthorized) trustline, an unauthorized or overflowing allowance — still
+surfaces with the token's number. **Clients must check which contract raised
+the error before mapping the number to a message.** On failure the diagnostic
+events name the failing contract (the SAC's contract id vs this contract's
+id); only errors raised by `tip_splitter` itself may be looked up in the table
+above. A bare `Error(Contract, #10)` with no source is ambiguous between
+`SplitsEmpty` and the SAC's `BalanceError`.
 
 ## Events
 
