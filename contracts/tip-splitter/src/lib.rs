@@ -65,6 +65,23 @@ const JAR_TTL_LEDGERS: u32 = 1_000_000;
 /// pays for the write occasionally rather than on every single access.
 const JAR_TTL_THRESHOLD: u32 = 500_000;
 
+/// The public interface this deployment speaks.
+///
+/// `tip` has already changed shape twice (three event elements, then four) and
+/// `jar_xfer` went from an address to a tuple, all under the same function
+/// names. A client that is only given a contract id had no way to tell which
+/// build it was talking to, so it discovered the mismatch when decoding failed
+/// — or, worse, silently ignored new data. This view lets it ask first.
+///
+/// Bump by one whenever the public interface changes: a function is added or
+/// removed, an error code is added or renumbered, or an event's shape changes.
+/// Do not bump for internal refactors, new storage keys, or doc edits — none of
+/// those are visible to a consumer.
+///
+/// This is a per-contract number for client feature detection. It complements
+/// the per-event schema version proposed in #83 rather than replacing it.
+const INTERFACE_VERSION: u32 = 1;
+
 /// One recipient and the share of every tip they receive, in basis points.
 #[contracttype]
 #[derive(Clone)]
@@ -79,6 +96,46 @@ pub struct Split {
 pub struct Jar {
     pub owner: Address,
     pub splits: Vec<Split>,
+}
+
+/// A jar's settled tip totals, kept on-chain next to the jar.
+///
+/// Every figure a creator sees normally comes from the backend indexer's
+/// database, which has known blind spots: a ledger that returns a full page of
+/// events is skipped by `planBatch` in `src/indexer/cursor.ts`, and an event
+/// older than the RPC's retention window can never be backfilled. A missed tip
+/// silently lowers a creator's totals and nothing on-chain contradicts it.
+/// These counters are the authoritative figure any client can read and compare
+/// with its own sum, with no dependence on Novatip's backend.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JarStats {
+    /// How many tips have settled to this jar.
+    pub tip_count: u64,
+    /// The cumulative amount of those tips.
+    ///
+    /// A raw, unitless sum, exactly like the minimum in `set_min_tip_amount`:
+    /// a tip paid in a non-default token is counted in that token's smallest
+    /// unit, so a jar tipped in several assets has a total that mixes units.
+    /// A consumer must not render this as a currency figure unless it knows
+    /// the jar has only ever been tipped in one asset.
+    pub total: i128,
+}
+
+/// One supporter's settled tip totals against one jar.
+///
+/// This is the on-chain data the roadmap's `supporter_badge` contract needs:
+/// milestones are phrased as "10 tips or $10 cumulative", and a badge contract
+/// cannot read the backend's `Tip` row. Before this existed a badge could only
+/// be minted by a trusted off-chain service asserting the milestone.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupporterStats {
+    /// How many tips this address has settled to this jar.
+    pub tip_count: u64,
+    /// The cumulative amount of those tips; same raw-unit caveat as
+    /// [`JarStats::total`].
+    pub total: i128,
 }
 
 /// The contract's hard bounds, returned by `get_limits`.
@@ -107,6 +164,20 @@ pub enum DataKey {
     Jar(String),
     /// Optional minimum tip amount for a jar keyed by its public slug.
     MinTip(String),
+    /// A jar's settled tip totals, under the same slug as the jar itself.
+    Stats(String),
+    /// One supporter's settled totals, keyed by the `(jar_id, supporter)` pair
+    /// the entry describes.
+    Supporter(String, Address),
+    /// An address in the tip allowlist, keyed by the token itself. Presence is
+    /// the whole answer, so `is_token_allowed` is a `has` check.
+    ///
+    /// Instance rather than persistent on purpose: an allowlist entry is
+    /// contract configuration, like the `Admin` and `Token` keys beside it. A
+    /// persistent entry nobody bumps is archived silently, which would surface
+    /// as "this token suddenly stopped working" with no admin having removed
+    /// it — the one failure mode an allowlist must not have.
+    AllowedToken(Address),
 }
 
 #[contracterror]
@@ -130,6 +201,20 @@ pub enum Error {
     SplitSumNot100Pct = 12,
     /// Tip amount is below the jar's configured minimum tip amount.
     BelowMinTipAmount = 13,
+    /// `tip_in_token` was given a token the admin has not put on the
+    /// allowlist. Checked before any transfer, so a rejection never moves
+    /// funds.
+    TokenNotAllowed = 14,
+    /// `disallow_token` was given the deploy-time default token. `tip` always
+    /// pays through that address, so removing it would leave a working `tip`
+    /// path for a token the allowlist view reports as closed.
+    CannotDisallowDefault = 15,
+    /// The running tip totals would not fit their fields. Unreachable in
+    /// practice — `u64` tip counts and `i128` sums cannot realistically be
+    /// exhausted by tips under `MAX_RECIPIENTS` — but the counters are bumped
+    /// with checked arithmetic so the failure is typed rather than an opaque
+    /// wasm trap, per #167.
+    StatsOverflow = 16,
 }
 
 #[contract]
@@ -138,9 +223,70 @@ pub struct TipSplitter;
 #[contractimpl]
 impl TipSplitter {
     /// Runs once at deploy time. `token` is the USDC Stellar Asset Contract id.
+    ///
+    /// The deploy-time token is also the first entry in the tip allowlist, so a
+    /// deployment is usable through `tip_in_token` immediately and
+    /// `get_token`/`is_token_allowed` can never disagree about it.
     pub fn __constructor(env: Env, admin: Address, token: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(token), &true);
+    }
+
+    /// The contract admin, which every admin-gated entry point requires.
+    /// Returns the address so the caller can name it in an event.
+    fn require_admin(env: &Env) -> Address {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        admin.require_auth();
+        admin
+    }
+
+    /// Add `token` to the allowlist `tip_in_token` accepts. Admin-only.
+    ///
+    /// Idempotent: allowing an already-allowed token succeeds and re-emits,
+    /// because the operation is a config assertion rather than a state
+    /// transition, and a deployment script that retries should not fail.
+    /// Emits a `tk_allow` event carrying the token and the admin who authorised
+    /// it, so an index of accepted assets can show provenance.
+    pub fn allow_token(env: Env, token: Address) {
+        let admin = Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedToken(token.clone()), &true);
+        env.events()
+            .publish((symbol_short!("tk_allow"), token), admin);
+    }
+
+    /// Remove `token` from the allowlist. Admin-only.
+    ///
+    /// The deploy-time default token cannot be removed: `tip` pays through it
+    /// unconditionally, so allowing its removal would leave a functioning tip
+    /// path for a token the allowlist reports as closed, and `get_token` would
+    /// contradict `is_token_allowed`. Rejected with `CannotDisallowDefault`.
+    ///
+    /// Emits a `tk_dis` event carrying the token and the admin. Existing tips
+    /// are untouched — this only stops future tips in that asset.
+    pub fn disallow_token(env: Env, token: Address) {
+        let admin = Self::require_admin(&env);
+        let default: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if token == default {
+            panic_with_error!(&env, Error::CannotDisallowDefault);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedToken(token.clone()));
+        env.events()
+            .publish((symbol_short!("tk_dis"), token), admin);
     }
 
     /// Register a new tip jar. `owner` must authorize. `jar_id` must be
@@ -268,20 +414,106 @@ impl TipSplitter {
             .publish((symbol_short!("min_tip"), jar_id), min_amount);
     }
 
-    /// Send a tip. Transfers `amount` of USDC from `from`, split across the jar's
-    /// recipients atomically, then emits a `("tip", jar_id)` event carrying the
-    /// sender, the total, the message, and the per-recipient breakdown in split
-    /// order.
+    /// Send a tip of `amount` of the deploy-time default token from `from`,
+    /// split across the jar's recipients atomically.
+    ///
+    /// Emits a `("tip", jar_id)` event carrying the sender, the total, the
+    /// message, the per-recipient breakdown in split order, and the token paid
+    /// in. Equivalent to `tip_in_token` with `get_token()`, and keeps the
+    /// jar's minimum tip enforced, since the token here is the one the minimum
+    /// was set in.
     ///
     /// `message` may be at most `MAX_MESSAGE_LEN` bytes; it is rejected before
     /// any funds move.
     pub fn tip(env: Env, from: Address, jar_id: String, amount: i128, message: String) {
         from.require_auth();
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        Self::settle_tip(&env, &from, &jar_id, amount, &message, &token_addr, true);
+    }
+
+    /// Send a tip of `amount` of `token`, for any token the admin has put on
+    /// the allowlist.
+    ///
+    /// A supporter holding EURC previously had to swap into the default token
+    /// before tipping; this lets them pay in the asset they hold. The
+    /// allowlist is checked before any funds move, so an unlisted token is
+    /// rejected with `TokenNotAllowed` rather than partially paying.
+    ///
+    /// The jar's minimum tip is **not** enforced here unless `token` is the
+    /// default token. `set_min_tip_amount` stores a raw number with no unit,
+    /// and one number cannot be a floor for several assets with different
+    /// decimal counts — 500 is $0.005 of a 7-decimal asset and $0.0005 of a
+    /// 6-decimal one. #170 allowed either "default token only" or "per-token";
+    /// this takes the first, because per-token minimums would change
+    /// `set_min_tip_amount`'s signature and the storage key, breaking jars that
+    /// already configured one. The consequence is explicit: a jar can be tipped
+    /// below its floor in another allowed asset, and a creator who cares
+    /// should keep the allowlist to the token they set the minimum in.
+    ///
+    /// `compute_shares` needs no equivalent decision: it splits by basis points
+    /// and never interprets the magnitude, so the same arithmetic is correct
+    /// for any asset.
+    pub fn tip_in_token(
+        env: Env,
+        from: Address,
+        jar_id: String,
+        token: Address,
+        amount: i128,
+        message: String,
+    ) {
+        from.require_auth();
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
+            panic_with_error!(&env, Error::TokenNotAllowed);
+        }
+        let default: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        Self::settle_tip(
+            &env,
+            &from,
+            &jar_id,
+            amount,
+            &message,
+            &token,
+            token == default,
+        );
+    }
+
+    /// The body both tip entry points share: validate, split atomically, bump
+    /// the running totals, and emit the `tip` event.
+    ///
+    /// `from` must already have authorized. `enforce_min` says whether this
+    /// call is in the token the jar's minimum tip is denominated in.
+    ///
+    /// Stats are written after the transfer loop. A transfer that traps (for
+    /// instance a sender with an insufficient balance) reverts the whole call,
+    /// so the counters never record a tip that did not settle — which is what
+    /// makes them usable as an authoritative check on the indexer.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_tip(
+        env: &Env,
+        from: &Address,
+        jar_id: &String,
+        amount: i128,
+        message: &String,
+        token_addr: &Address,
+        enforce_min: bool,
+    ) {
         if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
+            panic_with_error!(env, Error::InvalidAmount);
         }
         if message.len() > MAX_MESSAGE_LEN {
-            panic_with_error!(&env, Error::MessageTooLong);
+            panic_with_error!(env, Error::MessageTooLong);
         }
 
         let jar_key = DataKey::Jar(jar_id.clone());
@@ -289,17 +521,19 @@ impl TipSplitter {
             .storage()
             .persistent()
             .get(&jar_key)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, Error::JarNotFound));
 
         // Enforce optional per-jar minimum tip amount if configured
         let min_key = DataKey::MinTip(jar_id.clone());
-        if let Some(min_amount) = env.storage().persistent().get::<DataKey, i128>(&min_key) {
-            if amount < min_amount {
-                panic_with_error!(&env, Error::BelowMinTipAmount);
+        if enforce_min {
+            if let Some(min_amount) = env.storage().persistent().get::<DataKey, i128>(&min_key) {
+                if amount < min_amount {
+                    panic_with_error!(env, Error::BelowMinTipAmount);
+                }
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&min_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
             }
-            env.storage()
-                .persistent()
-                .extend_ttl(&min_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
         }
 
         // Bump the jar's storage entry so a jar that is tipped regularly
@@ -308,17 +542,12 @@ impl TipSplitter {
             .persistent()
             .extend_ttl(&jar_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
 
-        let token_addr: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let client = token::Client::new(&env, &token_addr);
+        let client = token::Client::new(env, token_addr);
 
         let n = jar.splits.len();
         // One shared calculation with `preview_split`, so the number a client
         // shows before signing is the number paid out here.
-        let shares = Self::compute_shares(&env, &jar.splits, amount);
+        let shares = Self::compute_shares(env, &jar.splits, amount);
 
         let mut skipped: i128 = 0;
         // The per-recipient breakdown published in the `tip` event, in split
@@ -326,7 +555,7 @@ impl TipSplitter {
         // self-describing: an indexer that recomputed the split arithmetic
         // from `get_jar` could get a different answer, because the jar's
         // splits may have changed between the tip and the read.
-        let mut breakdown: Vec<(Address, i128)> = Vec::new(&env);
+        let mut breakdown: Vec<(Address, i128)> = Vec::new(env);
         for i in 0..n {
             let split = jar.splits.get(i).unwrap();
             let mut share = shares.get(i).unwrap();
@@ -337,11 +566,11 @@ impl TipSplitter {
                 // accumulated only the amounts it actually transferred.
                 share += skipped;
             }
-            let paid = if share > 0 && split.to != from {
+            let paid = if share > 0 && split.to != *from {
                 // Skip self-transfers: a tipper who is also a recipient would
                 // otherwise pay themselves with a no-op transfer that burns gas
                 // and emits a confusing token event.
-                client.transfer(&from, &split.to, &share);
+                client.transfer(from, &split.to, &share);
                 share
             } else {
                 skipped += share;
@@ -354,10 +583,84 @@ impl TipSplitter {
             breakdown.push_back((split.to, paid));
         }
 
+        Self::bump_totals(env, jar_id, from, amount);
+
         env.events().publish(
-            (symbol_short!("tip"), jar_id),
-            (from, amount, message, breakdown),
+            (symbol_short!("tip"), jar_id.clone()),
+            (
+                from.clone(),
+                amount,
+                message.clone(),
+                breakdown,
+                token_addr.clone(),
+            ),
         );
+    }
+
+    /// Bump both running totals for a settled tip: the jar's aggregate and this
+    /// supporter's against that jar.
+    ///
+    /// Two extra persistent writes per tip, which is real rent — see the
+    /// measured budget delta in `docs/CONTRACT.md`. It buys a figure the
+    /// indexer can be checked against, and the reason #167 and #168 share one
+    /// helper is that they need the identical guarantee: both are updated only
+    /// after the transfers succeeded, in the same call that paid them out.
+    fn bump_totals(env: &Env, jar_id: &String, from: &Address, amount: i128) {
+        let stats_key = DataKey::Stats(jar_id.clone());
+        let jar_stats = env
+            .storage()
+            .persistent()
+            .get::<DataKey, JarStats>(&stats_key)
+            .map(|s| JarStats {
+                tip_count: s
+                    .tip_count
+                    .checked_add(1)
+                    .unwrap_or_else(|| panic_with_error!(env, Error::StatsOverflow)),
+                total: s
+                    .total
+                    .checked_add(amount)
+                    .unwrap_or_else(|| panic_with_error!(env, Error::StatsOverflow)),
+            })
+            .unwrap_or(JarStats {
+                tip_count: 1,
+                total: amount,
+            });
+        env.storage().persistent().set(&stats_key, &jar_stats);
+        // Same TTL policy as the jar entry, so the totals an indexer compares
+        // against outlive the jar they describe rather than archiving first.
+        env.storage()
+            .persistent()
+            .extend_ttl(&stats_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+
+        let supporter_key = DataKey::Supporter(jar_id.clone(), from.clone());
+        let supporter_stats = env
+            .storage()
+            .persistent()
+            .get::<DataKey, SupporterStats>(&supporter_key)
+            .map(|s| SupporterStats {
+                tip_count: s
+                    .tip_count
+                    .checked_add(1)
+                    .unwrap_or_else(|| panic_with_error!(env, Error::StatsOverflow)),
+                total: s
+                    .total
+                    .checked_add(amount)
+                    .unwrap_or_else(|| panic_with_error!(env, Error::StatsOverflow)),
+            })
+            .unwrap_or(SupporterStats {
+                tip_count: 1,
+                total: amount,
+            });
+        env.storage()
+            .persistent()
+            .set(&supporter_key, &supporter_stats);
+        // An archived entry here simply means the supporter has to tip again
+        // (or the entry is restored) — the history is not lost from the event
+        // log, and a badge check that reads zeros asks for a restore rather
+        // than minting on a wrong count.
+        env.storage()
+            .persistent()
+            .extend_ttl(&supporter_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
     }
 
     /// Read a jar's configuration.
@@ -489,6 +792,114 @@ impl TipSplitter {
                 .extend_ttl(&min_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
         }
         min_amount
+    }
+
+    /// A jar's running tip totals, as settled on-chain.
+    ///
+    /// A creator can compare this against the sum their own indexer recorded
+    /// and tell whether the indexer missed tips, which the backend's blind
+    /// spots (paged-out ledgers, events past the RPC's retention window) make
+    /// otherwise invisible. A third-party page or embeddable button gets a
+    /// total that does not depend on Novatip's backend at all.
+    ///
+    /// Returns zeros for a registered jar that has never been tipped — the
+    /// entry is created by the first tip, not by `create_jar`. Panics with
+    /// `JarNotFound` for an unregistered slug, matching `get_jar`: an untyped
+    /// zero would make a typo'd slug look like a jar nobody has tipped.
+    pub fn get_jar_stats(env: Env, jar_id: String) -> JarStats {
+        let jar_key = DataKey::Jar(jar_id.clone());
+        if !env.storage().persistent().has(&jar_key) {
+            panic_with_error!(&env, Error::JarNotFound);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&jar_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+
+        let key = DataKey::Stats(jar_id);
+        // Bump only when the entry exists: `extend_ttl` loads the entry, so
+        // bumping a key that has never been written fails with a storage error
+        // rather than returning zeros. Same shape as `get_min_tip_amount`.
+        match env.storage().persistent().get::<DataKey, JarStats>(&key) {
+            Some(stats) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+                stats
+            }
+            None => JarStats {
+                tip_count: 0,
+                total: 0,
+            },
+        }
+    }
+
+    /// One supporter's running tip totals against one jar.
+    ///
+    /// This is what lets the roadmap's `supporter_badge` contract verify a
+    /// milestone ("10 tips or $10 cumulative") on-chain instead of trusting an
+    /// off-chain service to assert it.
+    ///
+    /// Returns zeros for an address that has never tipped the jar. Panics with
+    /// `JarNotFound` for an unregistered slug, for the same reason
+    /// `get_jar_stats` does.
+    pub fn get_supporter_stats(env: Env, jar_id: String, supporter: Address) -> SupporterStats {
+        let jar_key = DataKey::Jar(jar_id.clone());
+        if !env.storage().persistent().has(&jar_key) {
+            panic_with_error!(&env, Error::JarNotFound);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&jar_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+
+        let key = DataKey::Supporter(jar_id, supporter);
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, SupporterStats>(&key)
+        {
+            Some(stats) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+                stats
+            }
+            None => SupporterStats {
+                tip_count: 0,
+                total: 0,
+            },
+        }
+    }
+
+    /// Which interface shape this deployment speaks.
+    ///
+    /// Reads no storage — it is a compile-time constant, like `get_limits`.
+    ///
+    /// `tip` has already changed event shape twice and `jar_xfer` once without
+    /// the name moving, and the SDK's `decodeTipEvent` still read three event
+    /// elements after the fourth was added. A client that knows only a contract
+    /// id can now ask before decoding, instead of discovering the mismatch when
+    /// parsing fails or silently dropping the new field.
+    ///
+    /// Treat a number you have not seen before as "newer than I was built
+    /// for": the fields this version documents still exist, so the safe
+    /// response is to read what you know and ignore the rest, not to refuse.
+    ///
+    /// Bump it whenever a function is added or removed, an error code is added
+    /// or renumbered, or an event's shape changes — see `INTERFACE_VERSION`.
+    /// This is per-contract feature detection and complements, rather than
+    /// replacing, the per-event schema version proposed in #83.
+    pub fn version(_env: Env) -> u32 {
+        INTERFACE_VERSION
+    }
+
+    /// Whether the admin has put `token` on the tip allowlist.
+    ///
+    /// A tip form needs to build its asset dropdown from what this contract
+    /// actually accepts, rather than assuming the deploy-time token is the only
+    /// option. The deploy-time token is always allowed; `tip` pays through it
+    /// regardless of this list.
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        env.storage().instance().has(&DataKey::AllowedToken(token))
     }
 
     /// Whether `jar_id` is already registered.
