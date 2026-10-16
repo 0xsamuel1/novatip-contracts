@@ -27,24 +27,44 @@ struct Limits { bps_denom: u32, max_recipients: u32, max_message_len: u32 }
 
 ## Functions
 
-| Function | Auth | Description |
-|----------|------|-------------|
-| `__constructor(admin, token)` | — | Deploy-time init. Stores the admin and USDC token address. |
-| `create_jar(owner, jar_id, splits)` | `owner` | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. |
-| `update_splits(jar_id, splits)` | jar `owner` | Replace a jar's splits. Subject to the same validation as `create_jar`. Emits a `splits` event. |
-| `set_min_tip_amount(jar_id, min_amount)` | jar `owner` | Set or clear an optional minimum tip amount for a jar. `min_amount` must be strictly positive (`> 0`) or `None` to clear. Emits a `min_tip` event. |
-| `transfer_jar_ownership(jar_id, new_owner)` | current jar `owner` | Hand control of a jar to `new_owner`. Splits are unchanged; the new owner does not need to authorize. Emits a `jar_xfer` event carrying both owners. |
-| `tip(from, jar_id, amount, message)` | `from` | Transfer `amount` USDC from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
-| `get_jar(jar_id) -> Jar` | — | Read a jar's configuration. Panics with `JarNotFound` if the slug is free. |
-| `get_jar_owner(jar_id) -> Address` | — | Read just a jar's owner. Panics with `JarNotFound` if the slug is free. |
-| `get_split_count(jar_id) -> u32` | — | How many recipients a jar pays. Panics with `JarNotFound` if the slug is free. |
-| `preview_split(jar_id, amount) -> Vec<i128>` | — | What each recipient would receive from a tip of `amount`, in split order. Rejects amounts below the jar's minimum with `BelowMinTipAmount` as well as the amounts `tip` rejects; panics with `JarNotFound` if the slug is free. |
-| `jar_exists(jar_id) -> bool` | — | Whether the slug is already registered. |
-| `is_recipient(jar_id, address) -> bool` | — | Whether `address` appears in the jar's splits. Panics with `JarNotFound` if the slug is free. |
-| `get_min_tip_amount(jar_id) -> Option<i128>` | — | Read a jar's optional minimum tip amount. Returns `None` if no minimum is set. Panics with `JarNotFound` if the slug is free. |
-| `get_token() -> Address` | — | The USDC token address tips settle in. |
-| `get_admin() -> Address` | — | The contract admin recorded at deploy time. |
-| `get_limits() -> Limits` | — | The bounds this contract enforces: `bps_denom`, `max_recipients`, `max_message_len`. Reads no storage. |
+The **Errors** column lists the `tip_splitter` error codes a call can return,
+**in the order the contract checks them** — only the first failure a call hits
+is reported, so the order tells a client what it will actually see. An error is
+written as raised only when every earlier check has passed.
+
+| Function | Auth | Errors (in check order) | Description |
+|----------|------|-------------------------|-------------|
+| `__constructor(admin, token)` | — | — | Deploy-time init. Stores the admin and USDC token address. |
+| `create_jar(owner, jar_id, splits)` | `owner` | `InvalidJarId` → `JarExists` → `SplitsEmpty` → `TooManyRecipients` → `SplitOutOfRange` / `DuplicateRecipient` (per entry) → `SplitSumNot100Pct` | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. |
+| `update_splits(jar_id, splits)` | jar `owner` | `JarNotFound` → `SplitsEmpty` → `TooManyRecipients` → `SplitOutOfRange` / `DuplicateRecipient` (per entry) → `SplitSumNot100Pct` | Replace a jar's splits. Subject to the same validation as `create_jar`. Emits a `splits` event. |
+| `set_min_tip_amount(jar_id, min_amount)` | jar `owner` | `JarNotFound` → `InvalidAmount` | Set or clear an optional minimum tip amount for a jar. `min_amount` must be strictly positive (`> 0`) or `None` to clear. Emits a `min_tip` event. |
+| `transfer_jar_ownership(jar_id, new_owner)` | current jar `owner` | `JarNotFound` | Hand control of a jar to `new_owner`. Splits are unchanged; the new owner does not need to authorize. Emits a `jar_xfer` event carrying both owners. |
+| `tip(from, jar_id, amount, message)` | `from` | `InvalidAmount` (amount ≤ 0) → `MessageTooLong` → `JarNotFound` → `BelowMinTipAmount` → `NotInitialized` → `InvalidAmount` (a share truncates to zero, or `amount * bps` overflows `i128`) | Transfer `amount` USDC from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. A failing token `transfer` reverts the whole call with the **token contract's own error**, not one of this contract's codes (e.g. an insufficient balance). |
+| `get_jar(jar_id) -> Jar` | — | `JarNotFound` | Read a jar's configuration. Panics with `JarNotFound` if the slug is free. |
+| `get_jar_owner(jar_id) -> Address` | — | `JarNotFound` | Read just a jar's owner. Panics with `JarNotFound` if the slug is free. |
+| `get_split_count(jar_id) -> u32` | — | `JarNotFound` | How many recipients a jar pays. Panics with `JarNotFound` if the slug is free. |
+| `preview_split(jar_id, amount) -> Vec<i128>` | — | `JarNotFound` → `BelowMinTipAmount` → `InvalidAmount` | What each recipient would receive from a tip of `amount`, in split order. Rejects amounts below the jar's minimum with `BelowMinTipAmount` as well as the amounts `tip` rejects; panics with `JarNotFound` if the slug is free. |
+| `jar_exists(jar_id) -> bool` | — | — | Whether the slug is already registered. Reads one key and returns a plain `bool`; never panics on a free slug. |
+| `is_recipient(jar_id, address) -> bool` | — | `JarNotFound` | Whether `address` appears in the jar's splits. Panics with `JarNotFound` if the slug is free. |
+| `get_min_tip_amount(jar_id) -> Option<i128>` | — | `JarNotFound` | Read a jar's optional minimum tip amount. Returns `None` if no minimum is set. Panics with `JarNotFound` if the slug is free. |
+| `get_token() -> Address` | — | `NotInitialized` | The USDC token address tips settle in. Reads instance storage; `NotInitialized` if the deploy-time token is absent. |
+| `get_admin() -> Address` | — | `NotInitialized` | The contract admin recorded at deploy time. Reads instance storage; `NotInitialized` if the deploy-time admin is absent. |
+| `get_limits() -> Limits` | — | — | The bounds this contract enforces: `bps_denom`, `max_recipients`, `max_message_len`. Reads no storage. |
+
+Two ordering notes that are easy to get wrong:
+
+- **Auth is not a contract error code.** A call that lacks the required
+  signature fails with Soroban's authorization error, not a `tip_splitter`
+  variant. The owner-only setters (`update_splits`, `set_min_tip_amount`,
+  `transfer_jar_ownership`) look the jar up *before* requiring the owner's
+  signature, so an unauthenticated caller using a free slug sees `JarNotFound`,
+  not an auth failure. `create_jar` requires the declared owner's signature
+  first.
+- **`tip` checks the message length before it looks up the jar**, so an
+  over-long message to an unregistered slug reports `MessageTooLong`, not
+  `JarNotFound`. Likewise `validate_splits` checks each entry's `bps` range
+  before scanning for that entry's duplicates, so
+  `[{to: a, bps: 0}, {to: a, bps: 10_000}]` reports `SplitOutOfRange`.
 
 ### Confirming you are a recipient
 
@@ -279,11 +299,11 @@ the code, so flipping that profile setting cannot turn it into a bypass.
 
 | Code | Name | Cause |
 |------|------|-------|
-| 1 | `NotInitialized` | Token address missing (should never happen post-deploy). |
+| 1 | `NotInitialized` | A deploy-time value is missing from instance storage: the USDC token address (raised by `get_token` and by `tip`) or the admin (raised by `get_admin`). Should never happen post-deploy. |
 | 2 | `JarExists` | Slug already registered. |
 | 3 | `JarNotFound` | Slug not registered. |
 | 4 | `InvalidSplits` | **No longer raised.** Split validation now reports the specific failure as code 10, 11 or 12. The variant is retained so existing codes keep their values. |
-| 5 | `InvalidAmount` | Tip amount ≤ 0, small enough that some recipient's share would truncate to zero, or so large that `amount * bps` overflows `i128` before the division. Raised by `tip` and by `preview_split`. |
+| 5 | `InvalidAmount` | Amount ≤ 0, small enough that some recipient's share would truncate to zero, or so large that `amount * bps` overflows `i128` before the division. Raised by `tip` and `preview_split` (over the tip amount) and by `set_min_tip_amount` (for a non-positive minimum). |
 | 6 | `TooManyRecipients` | More than 20 recipients. |
 | 7 | `DuplicateRecipient` | The same address appears more than once in the splits. |
 | 8 | `MessageTooLong` | Tip message exceeds 280 bytes. |
@@ -430,11 +450,12 @@ whether an address is a recipient *now*, use
 > three elements are unchanged and keep their positions, so a consumer that
 > ignores trailing elements is unaffected.
 
-## Jar discovery — design decision
+## Jar discovery — design note
 
-The previous contract exposed a `get_jar_ids() -> Vec<String>` view backed by
-an instance-storage vector that grew by one entry on every `create_jar` call.
-This had two problems:
+Indexing needs a way to enumerate every registered jar. An earlier design kept
+that list on-chain as a `get_jar_ids() -> Vec<String>` view backed by an
+instance-storage vector that grew by one entry on every `create_jar`. It had
+two problems:
 
 1. **Unbounded growth.** The vector had no removal path and no size cap, so it
    grew permanently with every jar ever created.
@@ -443,26 +464,35 @@ This had two problems:
    last, and the entry would eventually approach the ledger entry size limit,
    causing `create_jar` to fail for all callers.
 
-**Decision:** drop the on-chain list entirely and move discovery to the event
-log. `create_jar` now emits a `jar_crtd` event carrying the `jar_id` and
-`owner`. Indexers reconstruct the full jar list by scanning those events from
-ledger 0 (or from their last checkpoint). This is the standard pattern for
-Soroban contracts where enumeration is needed but unbounded on-chain state is
-not acceptable.
+**Decision — the design in use today:** keep no on-chain list and move discovery
+to the event log. `create_jar` emits a `jar_crtd` event carrying the `jar_id`
+and `owner`; indexers reconstruct the full jar list by scanning those events
+from the contract's creation ledger (or from their last checkpoint). This is the
+standard pattern for Soroban contracts where enumeration is needed but unbounded
+on-chain state is not acceptable, and it keeps `create_jar` cost O(1) regardless
+of how many jars exist.
 
-### Migration impact for the backend indexer
+### History, not instructions: this was never a `get_jar_ids` migration
 
-- **`get_jar_ids` is removed.** Any indexer code that calls this function must
-  be updated.
-- **Backfill required.** On first deploy of this version, the indexer must
-  replay all historical `jar_crtd` events from the contract's creation ledger
-  to reconstruct the jar list. If the previous contract was deployed with the
-  old version, existing jars will not have emitted `jar_crtd` events. Those
-  jars must be seeded into the indexer's database from the old `get_jar_ids`
-  response before upgrading, or discovered by replaying `create_jar`
-  invocation history from Horizon.
-- **Going forward,** every new jar emits `jar_crtd`, so no polling or
-  `get_jar_ids` calls are needed.
+The `get_jar_ids` view and its backing vector were **added and removed within a
+single unreleased cycle** (see `CHANGELOG.md`), so no published build ever
+exposed the function — there is nothing to migrate off or seed from. `v0.1.0`
+ships only `__constructor`, `create_jar`, `update_splits`, `tip`, `get_jar` and
+`get_token`.
+
+The real gap is event coverage, not a removed function. `jar_crtd` is emitted
+only by builds **after** `v0.1.0`:
+
+- A deployment built from `v0.1.0` never emitted `jar_crtd` at all, so the jars
+  it created are absent from the event log. The testnet contract referenced in
+  the README predates the current event payloads as well.
+- To find jars created on such a deployment, replay its `create_jar`
+  invocations from Horizon (Soroban transaction history), or seed them from an
+  off-chain snapshot — not from a `get_jar_ids` response, which no deployment
+  has ever returned.
+
+Every jar created by a build that emits `jar_crtd` needs no special handling:
+scanning the event log from the contract's creation ledger is enough.
 
 ## Deploy & bootstrap
 

@@ -1354,6 +1354,24 @@ fn tip_on_missing_jar_fails() {
     assert_eq!(res, Err(Ok(Error::JarNotFound.into())));
 }
 
+/// Backs the check-order claim in `docs/CONTRACT.md`: `tip` rejects an
+/// over-long message before it looks the jar up, so an over-long message to an
+/// unregistered slug reports `MessageTooLong`, not `JarNotFound`. Both
+/// conditions are true here — the amount is valid and the jar is missing — so
+/// only the earlier message-length guard can explain the reported code.
+#[test]
+fn tip_rejects_over_long_message_before_jar_lookup() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let tipper = Address::generate(env);
+    // One byte over MAX_MESSAGE_LEN (280), sent to a slug that was never registered.
+    let too_long = String::from_bytes(env, &[b'a'; 281]);
+    let res = client.try_tip(&tipper, &String::from_str(env, "@ghost"), &100, &too_long);
+    assert_eq!(res, Err(Ok(Error::MessageTooLong.into())));
+}
+
 /// `update_splits` runs the same lookup-then-panic path as `tip`, so an
 /// unregistered slug must be rejected rather than quietly creating a jar.
 #[test]

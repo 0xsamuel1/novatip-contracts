@@ -69,7 +69,9 @@ const JAR_TTL_THRESHOLD: u32 = 500_000;
 #[contracttype]
 #[derive(Clone)]
 pub struct Split {
+    /// Recipient that receives this share of every tip.
     pub to: Address,
+    /// Share of each tip in basis points, out of 10 000; a jar's splits sum to exactly 10 000.
     pub bps: u32,
 }
 
@@ -77,7 +79,9 @@ pub struct Split {
 #[contracttype]
 #[derive(Clone)]
 pub struct Jar {
+    /// Address that may change the jar — its splits, ownership, and minimum tip amount.
     pub owner: Address,
+    /// The recipients a tip is split across, and the share each one receives.
     pub splits: Vec<Split>,
 }
 
