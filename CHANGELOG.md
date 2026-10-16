@@ -5,6 +5,27 @@ All notable changes to `novatip-contracts` are documented here.
 ## [Unreleased]
 
 ### Added
+- `scripts/update-splits.sh` replaces a jar's splits with the same local
+  validation `create-jar.sh` applies (both now share `scripts/lib/splits.sh`).
+  It prints the old and new splits before sending, refuses unchanged splits,
+  and refuses to sign when `SOURCE` is not the jar's owner
+- `scripts/jar-info.sh`, a read-only inspector: owner, each recipient with its
+  share as a percentage, the minimum tip, and — with `AMOUNT` set — what a tip
+  of that size pays each recipient (`preview_split`). It submits nothing
+- `scripts/check-docs.sh` (`make check-docs`, CI step `docs-check`) builds the
+  contract and fails when `docs/CONTRACT.md`'s function or error tables no
+  longer match the built interface — missing or extra entries, or an error
+  documented with a different number
+- `scripts/lib/env.sh`, sourced by every script: loads the repository-root
+  `.env` (exported variables win), cds to the repo root so scripts work from
+  any directory, and reports missing settings by name
+
+### Changed
+- `make deploy` and `scripts/*.sh` no longer require a manual
+  `set -a; source .env; set +a`; `.env.example` documents the optional
+  `CONTRACT_ID` override and the testnet/mainnet USDC SAC ids
+
+### Added
 - `scripts/events.sh` lists the contract's published events with topic filters
   computed via `stellar xdr encode --type ScVal` instead of hand-encoded
   base64. Takes `EVENT` (one of the five event names or `all`), optional

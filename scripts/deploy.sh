@@ -3,18 +3,20 @@ set -euo pipefail
 
 # Deploy the tip_splitter contract to a Stellar network.
 #
+# .env (repository root) is loaded automatically; exported variables win over
+# it. The script works when started from any directory.
+#
 # Required env (see .env.example):
 #   NETWORK     testnet | mainnet | local
 #   SOURCE      Stellar CLI identity used to sign
 #   ADMIN       admin address stored in the contract
 #   USDC_TOKEN  USDC Stellar Asset Contract id (C...)
 #
-# Usage:  set -a; source .env; set +a; ./scripts/deploy.sh
+# Usage:  ./scripts/deploy.sh
 
-: "${NETWORK:?set NETWORK}"
-: "${SOURCE:?set SOURCE}"
-: "${ADMIN:?set ADMIN}"
-: "${USDC_TOKEN:?set USDC_TOKEN}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
+
+require_env NETWORK SOURCE ADMIN USDC_TOKEN
 
 echo "==> Building contracts"
 stellar contract build

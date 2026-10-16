@@ -9,6 +9,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The Stellar CLI does not ship with the plain-rust CI above, so this job
+  # installs a pinned version — deliberately the release line matching the
+  # soroban-sdk the contract builds against — and checks that
+  # docs/CONTRACT.md's function and error tables match the built interface.
+  # Bump STELLAR_VERSION together with a soroban-sdk major.
+  docs-check:
+    runs-on: ubuntu-latest
+    env:
+      STELLAR_VERSION: 22.0.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Stellar CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL -o stellar-cli.tar.gz \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_VERSION}/stellar-cli-${STELLAR_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar xzf stellar-cli.tar.gz
+          install stellar /usr/local/bin/stellar
+          stellar --version
+
+      - name: Show toolchain
+        run: rustup show
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Check CONTRACT.md against the built contract
+        run: ./scripts/check-docs.sh
+
   build-test:
     runs-on: ubuntu-latest
     steps:
