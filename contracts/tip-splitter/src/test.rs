@@ -133,11 +133,13 @@ fn tip_emits_tip_event_with_expected_topics_and_data() {
     );
 
     let message = String::from_str(env, "nice set");
-    client.tip(&tipper, &jar_id, &100, &message);
+    let seq = client.tip(&tipper, &jar_id, &100, &message);
 
     // decodeTipEvent in novatip-sdk reads topic 0 as the "tip" symbol, topic 1
-    // as the jar id, and the data as the (from, amount, message, breakdown)
-    // tuple.
+    // as the jar id, and the data as the (from, amount, message, breakdown,
+    // seq, reference) tuple. The last two are appended: every tip is numbered,
+    // and a plain `tip` publishes an explicit absent reference so one decoder
+    // serves both entry points.
     let tip_events: std::vec::Vec<_> = env
         .events()
         .all()
@@ -154,13 +156,362 @@ fn tip_emits_tip_event_with_expected_topics_and_data() {
             jar_id.into_val(env)
         ]
     );
-    let decoded: (Address, i128, String, Vec<(Address, i128)>) =
-        TryFromVal::try_from_val(env, data).expect("tip event data shape");
+    let decoded: TipEventData = TryFromVal::try_from_val(env, data).expect("tip event data shape");
     assert_eq!(
         decoded,
-        (tipper, 100i128, message, vec![env, (alice, 100i128)])
+        (
+            tipper,
+            100i128,
+            message,
+            vec![env, (alice, 100i128)],
+            seq,
+            None
+        )
+    );
+    // The number returned to the caller is the one published in the event.
+    assert_eq!(seq, 1);
+}
+
+/// The sequence number and reference read out of the `tip` events this contract
+/// published for `jar_id`.
+///
+/// Read immediately after the tip whose event is wanted: the test env only
+/// reliably reports the most recent invocation's events, and a reverted
+/// invocation clears them entirely.
+fn tip_seq_and_references(
+    env: &Env,
+    contract: &Address,
+    jar_id: &String,
+) -> std::vec::Vec<(u64, Option<BytesN<32>>)> {
+    let expected_topics = vec![
+        env,
+        symbol_short!("tip").into_val(env),
+        jar_id.into_val(env),
+    ];
+    env.events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == *contract && e.1 == expected_topics)
+        .map(|(_, _, data)| {
+            let (_, _, _, _, seq, reference): TipEventData =
+                TryFromVal::try_from_val(env, &data).expect("tip event data shape");
+            (seq, reference)
+        })
+        .collect()
+}
+
+/// A 32-byte reference filled with a recognisable pattern, standing in for an
+/// integration's own id.
+fn sample_reference(env: &Env, fill: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[fill; REFERENCE_LEN])
+}
+
+/// A tip needs an identifier of its own: two tips in one transaction share a
+/// transaction hash, and an indexer that deduplicates on the hash silently
+/// drops every tip after the first. So each tip gets the next number, returned
+/// to the caller and published in its own event, and `get_tip_count` tracks the
+/// total.
+#[test]
+fn successive_tips_get_consecutive_sequence_numbers() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &300);
+
+    let jar_id = String::from_str(env, "@seq");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+    // Nothing tipped yet.
+    assert_eq!(client.get_tip_count(), 0);
+
+    let first = client.tip(&tipper, &jar_id, &100, &String::from_str(env, "one"));
+    assert_eq!(
+        first, 1,
+        "numbers are 1-based, so 0 stays reserved for 'no tip yet'"
+    );
+    assert_eq!(
+        tip_seq_and_references(env, &s.contract, &jar_id),
+        std::vec![(1, None)]
+    );
+    assert_eq!(client.get_tip_count(), 1);
+
+    let second = client.tip(&tipper, &jar_id, &100, &String::from_str(env, "two"));
+    assert_eq!(second, 2);
+    assert_eq!(second - first, 1);
+    assert_eq!(
+        tip_seq_and_references(env, &s.contract, &jar_id),
+        std::vec![(2, None)]
+    );
+
+    // The view agrees with what was handed out, which is what lets a consumer
+    // prove it has not missed a tip.
+    assert_eq!(client.get_tip_count(), 2);
+}
+
+/// A tip that reverts must not consume a number, or every consumer would see a
+/// gap and be unable to tell "dropped by my scan" from "never happened".
+#[test]
+fn reverted_tip_does_not_consume_a_sequence_number() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &300);
+
+    let jar_id = String::from_str(env, "@nohole");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    assert_eq!(
+        client.tip(&tipper, &jar_id, &100, &String::from_str(env, "ok")),
+        1
+    );
+    assert_eq!(client.get_tip_count(), 1);
+
+    // Rejected before any transfer: an unregistered slug.
+    let missing = String::from_str(env, "@free");
+    assert!(client
+        .try_tip(&tipper, &missing, &100, &String::from_str(env, "boom"))
+        .is_err());
+    assert_eq!(
+        client.get_tip_count(),
+        1,
+        "a reverted tip leaves the counter where it was"
+    );
+    assert_eq!(token.balance(&alice), 100, "no funds moved");
+
+    // The next tip takes the number the failed one would have used, so the
+    // sequence has no hole for a consumer to mistake for a lost tip.
+    assert_eq!(
+        client.tip(&tipper, &jar_id, &100, &String::from_str(env, "still 2")),
+        2
+    );
+    assert_eq!(client.get_tip_count(), 2);
+}
+
+/// The reference is what lets an integration match a webhook back to the
+/// checkout session, bot command or pending alert that started the tip. The
+/// contract only echoes it — and `tip` publishes an explicit absent one, so a
+/// decoder reads the same six-element shape from either entry point.
+#[test]
+fn tip_with_ref_publishes_the_reference_and_tip_publishes_none() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &500);
+
+    let jar_id = String::from_str(env, "@ref");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 7000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 3000,
+            },
+        ],
+    );
+
+    // 32 arbitrary bytes: the contract ascribes no meaning to the contents.
+    let reference = BytesN::from_array(env, &std::array::from_fn(|i| i as u8 + 1));
+    let seq = client.tip_with_ref(
+        &tipper,
+        &jar_id,
+        &100,
+        &String::from_str(env, "via checkout"),
+        &Some(reference.clone()),
+    );
+
+    assert_eq!(
+        tip_seq_and_references(env, &s.contract, &jar_id),
+        std::vec![(seq, Some(reference.clone()))],
+        "the number returned to the caller is the one in the event, and the \
+         reference is echoed verbatim"
+    );
+    assert_eq!(token.balance(&alice), 70);
+    assert_eq!(token.balance(&bob), 30);
+
+    // A plain `tip` publishes an explicit absent reference rather than a
+    // shorter tuple, so one decoder handles both entry points.
+    let seq2 = client.tip(&tipper, &jar_id, &100, &String::from_str(env, "no ref"));
+    assert_eq!(seq2, 2);
+    assert_eq!(
+        tip_seq_and_references(env, &s.contract, &jar_id),
+        std::vec![(2, None)]
+    );
+    assert_eq!(token.balance(&alice), 140);
+}
+
+/// `tip` and `tip_with_ref` share one implementation, so the reference must not
+/// change what is paid, in what order, or how many times.
+#[test]
+fn tip_with_ref_moves_the_same_funds_as_tip() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &1000);
+
+    let jar_id = String::from_str(env, "@parity");
+    let splits = vec![
+        env,
+        Split {
+            to: alice.clone(),
+            bps: 7000,
+        },
+        Split {
+            to: bob.clone(),
+            bps: 3000,
+        },
+    ];
+    client.create_jar(&owner, &jar_id, &splits);
+
+    let reference = sample_reference(env, 7);
+    let with_ref = client.tip_with_ref(
+        &tipper,
+        &jar_id,
+        &101,
+        &String::from_str(env, "same maths"),
+        &Some(reference),
+    );
+    assert_eq!(with_ref, 1);
+    assert_eq!(
+        (token.balance(&alice), token.balance(&bob)),
+        (70, 31),
+        "dust to the last recipient, exactly as `tip` would pay"
+    );
+
+    // Same jar, same amount, no reference: identical outcome and the next
+    // number from the same counter.
+    let plain = client.tip(&tipper, &jar_id, &101, &String::from_str(env, "same maths"));
+    assert_eq!(plain, 2);
+    assert_eq!(token.balance(&alice), 140);
+    assert_eq!(token.balance(&bob), 62);
+    assert_eq!(token.balance(&tipper), 1000 - 202);
+}
+
+/// A reference costs nothing to leave out and is not stored: the jar and the
+/// tip count read the same whether or not a tip carried one, and nothing
+/// enforces uniqueness — a consumer that needs a guaranteed-unique id uses
+/// `seq`.
+#[test]
+fn reference_is_not_stored_and_not_required_to_be_unique() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &500);
+
+    let jar_id = String::from_str(env, "@opaque");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    let reference = sample_reference(env, 9);
+    for expected in [1u64, 2] {
+        assert_eq!(
+            client.tip_with_ref(
+                &tipper,
+                &jar_id,
+                &100,
+                &String::from_str(env, "dup ref"),
+                &Some(reference.clone()),
+            ),
+            expected,
+            "two tips with the same reference both succeed"
+        );
+        assert_eq!(
+            tip_seq_and_references(env, &s.contract, &jar_id),
+            std::vec![(expected, Some(reference.clone()))]
+        );
+    }
+
+    // Nothing about the jar changed because a reference rode along.
+    assert_eq!(client.get_jar(&jar_id).splits.len(), 1);
+    assert_eq!(client.get_tip_count(), 2);
+
+    // And an explicit `None` is accepted too, not just an omitted argument.
+    assert_eq!(
+        client.tip_with_ref(
+            &tipper,
+            &jar_id,
+            &100,
+            &String::from_str(env, "no ref"),
+            &None,
+        ),
+        3
     );
 }
+
+/// The `tip` event's data, decoded in its published positional order:
+/// `from`, `amount`, `message`, `breakdown`, then the two fields added by this
+/// change — the tip's sequence number and its optional client reference.
+type TipEventData = (
+    Address,
+    i128,
+    String,
+    Vec<(Address, i128)>,
+    u64,
+    Option<BytesN<32>>,
+);
 
 /// Reads the per-recipient breakdown out of the single `tip` event this
 /// contract published.
@@ -178,7 +529,7 @@ fn tip_breakdown(env: &Env, contract: &Address, jar_id: &String) -> std::vec::Ve
         .collect();
     assert_eq!(events.len(), 1, "expected exactly one tip event");
     let (_, _, data) = events.first().unwrap();
-    let (_, _, _, breakdown): (Address, i128, String, Vec<(Address, i128)>) =
+    let (_, _, _, breakdown, _, _): TipEventData =
         TryFromVal::try_from_val(env, data).expect("tip event data shape");
     (0..breakdown.len())
         .map(|i| breakdown.get(i).unwrap())

@@ -5,6 +5,36 @@ All notable changes to `novatip-contracts` are documented here.
 ## [Unreleased]
 
 ### Added
+- `tip` returns the tip's sequence number and every successful tip increments a
+  contract-wide `u64`, published as the fifth element of the `tip` event. A
+  consumer can now order tips and prove it has seen all of them, which the
+  transaction hash could not do: two tips in one batched transaction share a
+  hash, and an indexer upserting on it dropped every one after the first.
+  `get_tip_count() -> u64` exposes the running total (`0` on a fresh deploy) as a
+  cheap completeness check
+- `tip_with_ref(from, jar_id, amount, message, reference)` — the same tip with an
+  optional opaque 32-byte client reference echoed in the `tip` event, so an
+  integration that created something off-chain (a checkout session, a bot
+  command, a pending alert) can match the event back to it. The contract neither
+  stores it nor enforces uniqueness; omitting it costs nothing. `tip` keeps its
+  existing signature and publishes an explicit `None` in the same position, and
+  both entry points share one internal implementation so they cannot drift
+- `scripts/transfer-jar.sh` and `scripts/set-min-tip.sh` cover the two remaining
+  jar-owner calls, which until now had to be assembled as `stellar contract
+  invoke` commands by hand. `set-min-tip.sh` clears a minimum by omitting
+  `--min_amount` entirely — the only spelling of `Option::None` the CLI accepts —
+  and rejects zero, negative and non-numeric amounts locally, before paying for a
+  network call. `.env.example` documents `NEW_OWNER` and `MIN_TIP`, and the
+  README gained a scripts section
+- `docs/CONTRACT.md` gained an **Authorization** section describing what a
+  signature actually commits to: a tipper authorizes the `tip` call plus one
+  token transfer per paid recipient, with the exact recipient and amount. That
+  explains why wallets show N transfers rather than one payment to the contract,
+  why a tip signed against old splits fails with `Error(Context, InvalidAction)`
+  once `update_splits` lands (so an owner cannot redirect a tip in flight), and
+  that the client's recovery is to re-simulate and re-sign rather than retry
+
+### Changed (breaking: event payload)
 - `get_limits() -> Limits` returns `bps_denom`, `max_recipients` and
   `max_message_len`, so clients read the bounds from the contract they are
   talking to instead of hardcoding their own copy
@@ -14,6 +44,13 @@ All notable changes to `novatip-contracts` are documented here.
   quiet `false`
 
 ### Changed (breaking: event payload)
+- The `tip` event's data tuple grew from four elements to six: `seq: u64` and
+  `reference: Option<BytesN<32>>` were appended after `breakdown`. A positional
+  decoder (`decodeTipEvent` in `@novatip/sdk`, the backend indexer) must accept
+  both before reading events from a contract built from this version; the first
+  four elements keep their positions, so a consumer that ignores trailing
+  elements is unaffected. Neither joins the topics, because the SDK's
+  `tipTopicFilter` requires exactly one segment per published topic
 - The `tip` event's data tuple gained a fourth element, `breakdown:
   Vec<(Address, i128)>`, listing each recipient and the amount they were
   actually paid in split order. An indexer no longer has to fetch the jar and

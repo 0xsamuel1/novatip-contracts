@@ -15,7 +15,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, String, Vec,
+    Address, BytesN, Env, String, Vec,
 };
 
 /// 100% expressed in basis points.
@@ -44,6 +44,22 @@ const MAX_JAR_ID_LEN: u32 = 64;
 /// Clients should count UTF-8 bytes — not `message.length` in JavaScript or
 /// `len(message)` in Rust — to show an accurate remaining-bytes indicator.
 const MAX_MESSAGE_LEN: u32 = 280;
+
+/// Width, in bytes, of the optional client reference a tipper may attach.
+///
+/// A reference is an opaque id the integration uses to match the on-chain
+/// `tip` event back to whatever it created off-chain (a pending alert, a bot
+/// command, a checkout session). 32 bytes fits the id spaces those clients
+/// already use — a UUIDv4 in binary, a `sha256` tag, an 8-byte big-endian
+/// primary key — without the contract ascribing any meaning to the contents.
+///
+/// Written as a literal `BytesN<32>` in the entry-point signatures rather than
+/// `BytesN<REFERENCE_LEN>`: `#[contractimpl]` parses the generic arguments of
+/// its own parameters and rejects a const with
+/// "incorrect number of generic arguments, expect one for BytesN<N>", which
+/// aborts expansion of the whole impl — every method then vanishes from the
+/// generated client, and the error surfaces far from its cause.
+pub const REFERENCE_LEN: usize = 32;
 
 /// How long a jar's persistent entry is extended to on access, in ledgers.
 ///
@@ -107,6 +123,10 @@ pub enum DataKey {
     Jar(String),
     /// Optional minimum tip amount for a jar keyed by its public slug.
     MinTip(String),
+    /// Contract-wide count of successful tips, used as each tip's sequence
+    /// number. Held in instance storage: one `u64`, incremented once per tip,
+    /// independent of how many jars exist.
+    TipCount,
 }
 
 #[contracterror]
@@ -270,12 +290,61 @@ impl TipSplitter {
 
     /// Send a tip. Transfers `amount` of USDC from `from`, split across the jar's
     /// recipients atomically, then emits a `("tip", jar_id)` event carrying the
-    /// sender, the total, the message, and the per-recipient breakdown in split
-    /// order.
+    /// sender, the total, the message, the per-recipient breakdown in split
+    /// order, this tip's sequence number, and an absent reference.
     ///
     /// `message` may be at most `MAX_MESSAGE_LEN` bytes; it is rejected before
     /// any funds move.
-    pub fn tip(env: Env, from: Address, jar_id: String, amount: i128, message: String) {
+    ///
+    /// Returns the tip's sequence number, so the supporter's own client learns
+    /// which tip it just sent without waiting for the event log. See
+    /// [`tip_with_ref`] for attaching a client reference, and
+    /// [`Self::get_tip_count`] to read the running total.
+    pub fn tip(env: Env, from: Address, jar_id: String, amount: i128, message: String) -> u64 {
+        Self::tip_inner(env, from, jar_id, amount, message, None)
+    }
+
+    /// Send a tip carrying an optional 32-byte client `reference`.
+    ///
+    /// An integration that starts a tip off-chain (a pending alert, a bot
+    /// command, a checkout session) needs to recognise that tip when it comes
+    /// back through the indexer or a webhook. Sender, amount, and the free-text
+    /// message are none of them unique, and the message is visible to the
+    /// creator so it cannot carry an opaque id. `reference` is that id: the
+    /// contract publishes it verbatim in the `tip` event and stores nothing.
+    ///
+    /// The value is opaque by design — not persisted, not checked for
+    /// uniqueness, not interpreted. Passing `None` costs nothing, and a
+    /// collision between two integrations' references is the consumers' problem
+    /// to resolve, not the contract's.
+    ///
+    /// Identical to [`tip`] in every other respect: same transfers, same
+    /// validation, same sequence numbering. Both entry points call one internal
+    /// implementation, so they cannot drift apart.
+    pub fn tip_with_ref(
+        env: Env,
+        from: Address,
+        jar_id: String,
+        amount: i128,
+        message: String,
+        reference: Option<BytesN<32>>,
+    ) -> u64 {
+        Self::tip_inner(env, from, jar_id, amount, message, reference)
+    }
+
+    /// The single transfer loop behind `tip` and `tip_with_ref`.
+    ///
+    /// Kept private and non-exposed so the two public entry points cannot
+    /// disagree about validation, the order of transfers, the self-transfer
+    /// skip, or the event shape.
+    fn tip_inner(
+        env: Env,
+        from: Address,
+        jar_id: String,
+        amount: i128,
+        message: String,
+        reference: Option<BytesN<32>>,
+    ) -> u64 {
         from.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, Error::InvalidAmount);
@@ -354,10 +423,54 @@ impl TipSplitter {
             breakdown.push_back((split.to, paid));
         }
 
+        // Assign the sequence number only now that every transfer has
+        // succeeded. Soroban rolls the whole transaction back on a panic, so a
+        // reverted tip consumes no storage either; incrementing after the loop
+        // additionally means a tip that traps mid-split leaves the counter
+        // where it was, so no number is ever skipped.
+        //
+        // A tip is the only writer of this key, so on a contract that has taken
+        // at least one tip the entry is present. `unwrap_or(0)` covers the very
+        // first tip, whose increment turns it into 1.
+        let seq: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TipCount)
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().instance().set(&DataKey::TipCount, &seq);
+
+        // The sequence number and the reference are appended after the four
+        // elements `decodeTipEvent` already reads, in this fixed order, so a
+        // positional decoder keeps working and the new fields occupy documented
+        // slots. Neither joins the topics: the SDK's `tipTopicFilter` asserts
+        // one segment per published topic, so a third topic would make its
+        // existing two-segment filter match nothing.
         env.events().publish(
             (symbol_short!("tip"), jar_id),
-            (from, amount, message, breakdown),
+            (from, amount, message, breakdown, seq, reference),
         );
+
+        seq
+    }
+
+    /// The number of tips this contract has taken, and the sequence number the
+    /// next tip will receive.
+    ///
+    /// Every successful tip increments a contract-wide `u64` by one and the
+    /// `tip` event carries that value, so a consumer can order tips and, more
+    /// importantly, tell that it has seen all of them: an indexer that has
+    /// stored numbers 1..N and reads N here has missed nothing. A gap means the
+    /// event scan is incomplete, which the transaction hash cannot reveal
+    /// because two tips in one batched transaction share it.
+    ///
+    /// Returns `0` on a fresh deploy. The counter is contract-wide, not
+    /// per-jar.
+    pub fn get_tip_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TipCount)
+            .unwrap_or(0u64)
     }
 
     /// Read a jar's configuration.
