@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Novatip/novatip-docs/blob/main/SECURITY.md
+    about: This contract holds payment logic — please report security issues through the private channel, not a public issue.
+  - name: Contributing guide
+    url: https://github.com/Novatip/novatip-docs/blob/main/CONTRIBUTING.md
+    about: Fork/branch/PR workflow, conventional commits, and the fmt/clippy/test checks before you open a pull request.

@@ -224,11 +224,16 @@ fn tip_emits_tip_event_with_expected_topics_and_data() {
     );
 
     let message = String::from_str(env, "nice set");
-    client.tip(&tipper, &jar_id, &100, &message);
+    let seq = client.tip(&tipper, &jar_id, &100, &message);
 
     // decodeTipEvent in novatip-sdk reads topic 0 as the "tip" symbol, topic 1
-    // as the jar id, and the data as the (from, amount, message, breakdown)
-    // tuple.
+    // as the jar id, and the data as the (from, amount, message, breakdown,
+    // token) tuple. The fifth element is new: without it an indexer cannot
+    // tell 10 USDC from 10 XLM, so every consumer of this event has to read
+    // five elements now — see `version()` for how a client detects that.
+    // seq, reference) tuple. The last two are appended: every tip is numbered,
+    // and a plain `tip` publishes an explicit absent reference so one decoder
+    // serves both entry points.
     let tip_events: std::vec::Vec<_> = env
         .events()
         .all()
@@ -246,7 +251,9 @@ fn tip_emits_tip_event_with_expected_topics_and_data() {
         ]
     );
     let decoded: (Address, i128, String, Vec<(Address, i128, bool)>) =
+    let decoded: (Address, i128, String, Vec<(Address, i128)>, Address) =
         TryFromVal::try_from_val(env, data).expect("tip event data shape");
+    let decoded: TipEventData = TryFromVal::try_from_val(env, data).expect("tip event data shape");
     assert_eq!(
         decoded,
         (
@@ -255,8 +262,357 @@ fn tip_emits_tip_event_with_expected_topics_and_data() {
             message,
             vec![env, (alice.clone(), 100i128, false)]
         )
+            vec![env, (alice, 100i128)],
+            s.token.clone()
+        )
+            seq,
+            None
+        )
+    );
+    // The number returned to the caller is the one published in the event.
+    assert_eq!(seq, 1);
+}
+
+/// The sequence number and reference read out of the `tip` events this contract
+/// published for `jar_id`.
+///
+/// Read immediately after the tip whose event is wanted: the test env only
+/// reliably reports the most recent invocation's events, and a reverted
+/// invocation clears them entirely.
+fn tip_seq_and_references(
+    env: &Env,
+    contract: &Address,
+    jar_id: &String,
+) -> std::vec::Vec<(u64, Option<BytesN<32>>)> {
+    let expected_topics = vec![
+        env,
+        symbol_short!("tip").into_val(env),
+        jar_id.into_val(env),
+    ];
+    env.events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == *contract && e.1 == expected_topics)
+        .map(|(_, _, data)| {
+            let (_, _, _, _, seq, reference): TipEventData =
+                TryFromVal::try_from_val(env, &data).expect("tip event data shape");
+            (seq, reference)
+        })
+        .collect()
+}
+
+/// A 32-byte reference filled with a recognisable pattern, standing in for an
+/// integration's own id.
+fn sample_reference(env: &Env, fill: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[fill; REFERENCE_LEN])
+}
+
+/// A tip needs an identifier of its own: two tips in one transaction share a
+/// transaction hash, and an indexer that deduplicates on the hash silently
+/// drops every tip after the first. So each tip gets the next number, returned
+/// to the caller and published in its own event, and `get_tip_count` tracks the
+/// total.
+#[test]
+fn successive_tips_get_consecutive_sequence_numbers() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &300);
+
+    let jar_id = String::from_str(env, "@seq");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+    // Nothing tipped yet.
+    assert_eq!(client.get_tip_count(), 0);
+
+    let first = client.tip(&tipper, &jar_id, &100, &String::from_str(env, "one"));
+    assert_eq!(
+        first, 1,
+        "numbers are 1-based, so 0 stays reserved for 'no tip yet'"
+    );
+    assert_eq!(
+        tip_seq_and_references(env, &s.contract, &jar_id),
+        std::vec![(1, None)]
+    );
+    assert_eq!(client.get_tip_count(), 1);
+
+    let second = client.tip(&tipper, &jar_id, &100, &String::from_str(env, "two"));
+    assert_eq!(second, 2);
+    assert_eq!(second - first, 1);
+    assert_eq!(
+        tip_seq_and_references(env, &s.contract, &jar_id),
+        std::vec![(2, None)]
+    );
+
+    // The view agrees with what was handed out, which is what lets a consumer
+    // prove it has not missed a tip.
+    assert_eq!(client.get_tip_count(), 2);
+}
+
+/// A tip that reverts must not consume a number, or every consumer would see a
+/// gap and be unable to tell "dropped by my scan" from "never happened".
+#[test]
+fn reverted_tip_does_not_consume_a_sequence_number() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &300);
+
+    let jar_id = String::from_str(env, "@nohole");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    assert_eq!(
+        client.tip(&tipper, &jar_id, &100, &String::from_str(env, "ok")),
+        1
+    );
+    assert_eq!(client.get_tip_count(), 1);
+
+    // Rejected before any transfer: an unregistered slug.
+    let missing = String::from_str(env, "@free");
+    assert!(client
+        .try_tip(&tipper, &missing, &100, &String::from_str(env, "boom"))
+        .is_err());
+    assert_eq!(
+        client.get_tip_count(),
+        1,
+        "a reverted tip leaves the counter where it was"
+    );
+    assert_eq!(token.balance(&alice), 100, "no funds moved");
+
+    // The next tip takes the number the failed one would have used, so the
+    // sequence has no hole for a consumer to mistake for a lost tip.
+    assert_eq!(
+        client.tip(&tipper, &jar_id, &100, &String::from_str(env, "still 2")),
+        2
+    );
+    assert_eq!(client.get_tip_count(), 2);
+}
+
+/// The reference is what lets an integration match a webhook back to the
+/// checkout session, bot command or pending alert that started the tip. The
+/// contract only echoes it — and `tip` publishes an explicit absent one, so a
+/// decoder reads the same six-element shape from either entry point.
+#[test]
+fn tip_with_ref_publishes_the_reference_and_tip_publishes_none() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &500);
+
+    let jar_id = String::from_str(env, "@ref");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 7000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 3000,
+            },
+        ],
+    );
+
+    // 32 arbitrary bytes: the contract ascribes no meaning to the contents.
+    let reference = BytesN::from_array(env, &std::array::from_fn(|i| i as u8 + 1));
+    let seq = client.tip_with_ref(
+        &tipper,
+        &jar_id,
+        &100,
+        &String::from_str(env, "via checkout"),
+        &Some(reference.clone()),
+    );
+
+    assert_eq!(
+        tip_seq_and_references(env, &s.contract, &jar_id),
+        std::vec![(seq, Some(reference.clone()))],
+        "the number returned to the caller is the one in the event, and the \
+         reference is echoed verbatim"
+    );
+    assert_eq!(token.balance(&alice), 70);
+    assert_eq!(token.balance(&bob), 30);
+
+    // A plain `tip` publishes an explicit absent reference rather than a
+    // shorter tuple, so one decoder handles both entry points.
+    let seq2 = client.tip(&tipper, &jar_id, &100, &String::from_str(env, "no ref"));
+    assert_eq!(seq2, 2);
+    assert_eq!(
+        tip_seq_and_references(env, &s.contract, &jar_id),
+        std::vec![(2, None)]
+    );
+    assert_eq!(token.balance(&alice), 140);
+}
+
+/// `tip` and `tip_with_ref` share one implementation, so the reference must not
+/// change what is paid, in what order, or how many times.
+#[test]
+fn tip_with_ref_moves_the_same_funds_as_tip() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &1000);
+
+    let jar_id = String::from_str(env, "@parity");
+    let splits = vec![
+        env,
+        Split {
+            to: alice.clone(),
+            bps: 7000,
+        },
+        Split {
+            to: bob.clone(),
+            bps: 3000,
+        },
+    ];
+    client.create_jar(&owner, &jar_id, &splits);
+
+    let reference = sample_reference(env, 7);
+    let with_ref = client.tip_with_ref(
+        &tipper,
+        &jar_id,
+        &101,
+        &String::from_str(env, "same maths"),
+        &Some(reference),
+    );
+    assert_eq!(with_ref, 1);
+    assert_eq!(
+        (token.balance(&alice), token.balance(&bob)),
+        (70, 31),
+        "dust to the last recipient, exactly as `tip` would pay"
+    );
+
+    // Same jar, same amount, no reference: identical outcome and the next
+    // number from the same counter.
+    let plain = client.tip(&tipper, &jar_id, &101, &String::from_str(env, "same maths"));
+    assert_eq!(plain, 2);
+    assert_eq!(token.balance(&alice), 140);
+    assert_eq!(token.balance(&bob), 62);
+    assert_eq!(token.balance(&tipper), 1000 - 202);
+}
+
+/// A reference costs nothing to leave out and is not stored: the jar and the
+/// tip count read the same whether or not a tip carried one, and nothing
+/// enforces uniqueness — a consumer that needs a guaranteed-unique id uses
+/// `seq`.
+#[test]
+fn reference_is_not_stored_and_not_required_to_be_unique() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &500);
+
+    let jar_id = String::from_str(env, "@opaque");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    let reference = sample_reference(env, 9);
+    for expected in [1u64, 2] {
+        assert_eq!(
+            client.tip_with_ref(
+                &tipper,
+                &jar_id,
+                &100,
+                &String::from_str(env, "dup ref"),
+                &Some(reference.clone()),
+            ),
+            expected,
+            "two tips with the same reference both succeed"
+        );
+        assert_eq!(
+            tip_seq_and_references(env, &s.contract, &jar_id),
+            std::vec![(expected, Some(reference.clone()))]
+        );
+    }
+
+    // Nothing about the jar changed because a reference rode along.
+    assert_eq!(client.get_jar(&jar_id).splits.len(), 1);
+    assert_eq!(client.get_tip_count(), 2);
+
+    // And an explicit `None` is accepted too, not just an omitted argument.
+    assert_eq!(
+        client.tip_with_ref(
+            &tipper,
+            &jar_id,
+            &100,
+            &String::from_str(env, "no ref"),
+            &None,
+        ),
+        3
     );
 }
+
+/// The `tip` event's data, decoded in its published positional order:
+/// `from`, `amount`, `message`, `breakdown`, then the two fields added by this
+/// change — the tip's sequence number and its optional client reference.
+type TipEventData = (
+    Address,
+    i128,
+    String,
+    Vec<(Address, i128)>,
+    u64,
+    Option<BytesN<32>>,
+);
 
 /// Reads the per-recipient breakdown out of the single `tip` event this
 /// contract published.
@@ -275,6 +631,8 @@ fn tip_breakdown(env: &Env, contract: &Address, jar_id: &String) -> std::vec::Ve
     assert_eq!(events.len(), 1, "expected exactly one tip event");
     let (_, _, data) = events.first().unwrap();
     let (_, _, _, breakdown): (Address, i128, String, Vec<(Address, i128, bool)>) =
+    let (_, _, _, breakdown, _): (Address, i128, String, Vec<(Address, i128)>, Address) =
+    let (_, _, _, breakdown, _, _): TipEventData =
         TryFromVal::try_from_val(env, data).expect("tip event data shape");
     (0..breakdown.len())
         .map(|i| {
@@ -1453,6 +1811,24 @@ fn tip_on_missing_jar_fails() {
     assert_eq!(res, Err(Ok(Error::JarNotFound.into())));
 }
 
+/// Backs the check-order claim in `docs/CONTRACT.md`: `tip` rejects an
+/// over-long message before it looks the jar up, so an over-long message to an
+/// unregistered slug reports `MessageTooLong`, not `JarNotFound`. Both
+/// conditions are true here — the amount is valid and the jar is missing — so
+/// only the earlier message-length guard can explain the reported code.
+#[test]
+fn tip_rejects_over_long_message_before_jar_lookup() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let tipper = Address::generate(env);
+    // One byte over MAX_MESSAGE_LEN (280), sent to a slug that was never registered.
+    let too_long = String::from_bytes(env, &[b'a'; 281]);
+    let res = client.try_tip(&tipper, &String::from_str(env, "@ghost"), &100, &too_long);
+    assert_eq!(res, Err(Ok(Error::MessageTooLong.into())));
+}
+
 /// `update_splits` runs the same lookup-then-panic path as `tip`, so an
 /// unregistered slug must be rejected rather than quietly creating a jar.
 #[test]
@@ -1812,7 +2188,7 @@ fn tip_fails_when_sender_has_insufficient_balance() {
     client.create_jar(&owner, &jar_id, &splits);
 
     let res = client.try_tip(&tipper, &jar_id, &100, &String::from_str(env, "oops"));
-    assert!(res.is_err());
+    assert_eq!(res, Err(Ok(Error::InsufficientBalance.into())));
 
     // Balances must be unchanged — tipper keeps their 50, alice gets nothing.
     assert_eq!(token.balance(&tipper), 50);
@@ -1867,8 +2243,9 @@ fn tip_multi_recipient_no_partial_distribution_on_insufficient_balance() {
         &String::from_str(env, "not enough"),
     );
 
-    // The call must fail.
-    assert!(res.is_err());
+    // The call must fail with the contract's own insufficient-balance code,
+    // not the token's overlapping number.
+    assert_eq!(res, Err(Ok(Error::InsufficientBalance.into())));
 
     // Atomicity: every recipient balance must still be 0 — no partial payment.
     assert_eq!(
@@ -3125,6 +3502,22 @@ fn tip_holds_share_of_deauthorised_recipient_and_withdraw_pays_it() {
     token.mint(&tipper, &1_000);
 
     let jar_id = String::from_str(env, "@band");
+// ---------------------------------------------------------------------------
+// #167 — per-jar running tip totals
+// ---------------------------------------------------------------------------
+
+/// A jar exists before it has been tipped, so its counters must read zero
+/// rather than `JarNotFound`: "nobody has tipped this yet" is a real answer a
+/// tip page shows.
+#[test]
+fn get_jar_stats_is_zero_before_the_first_tip() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let jar_id = String::from_str(env, "@untouched");
     client.create_jar(
         &owner,
         &jar_id,
@@ -3184,6 +3577,36 @@ fn withdraw_held_requires_the_recipients_own_authorisation() {
     token.mint(&tipper, &1_000);
 
     let jar_id = String::from_str(env, "@solo");
+                bps: 10000,
+            },
+        ],
+    );
+
+    assert_eq!(
+        client.get_jar_stats(&jar_id),
+        JarStats {
+            tip_count: 0,
+            total: 0
+        }
+    );
+}
+
+/// Several tips to one jar accumulate into that jar, in both fields.
+#[test]
+fn get_jar_stats_counts_several_tips_to_one_jar() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let one = Address::generate(env);
+    let two = Address::generate(env);
+    token_admin.mint(&one, &1_000);
+    token_admin.mint(&two, &1_000);
+
+    let jar_id = String::from_str(env, "@tally");
     client.create_jar(
         &owner,
         &jar_id,
@@ -3191,6 +3614,7 @@ fn withdraw_held_requires_the_recipients_own_authorisation() {
             env,
             Split {
                 to: bob.clone(),
+                to: alice.clone(),
                 bps: 10000,
             },
         ],
@@ -3211,6 +3635,36 @@ fn leave_jar_reassigns_departing_share_to_last_entry() {
     let s = setup();
     let env = &s.env;
     let client = TipSplitterClient::new(env, &s.contract);
+
+    client.tip(&one, &jar_id, &100, &String::from_str(env, "a"));
+    assert_eq!(
+        client.get_jar_stats(&jar_id),
+        JarStats {
+            tip_count: 1,
+            total: 100
+        }
+    );
+
+    client.tip(&two, &jar_id, &250, &String::from_str(env, "b"));
+    client.tip(&one, &jar_id, &50, &String::from_str(env, "c"));
+    assert_eq!(
+        client.get_jar_stats(&jar_id),
+        JarStats {
+            tip_count: 3,
+            total: 400
+        },
+        "the jar total counts every supporter, not one supporter's tips"
+    );
+}
+
+/// Two jars tipped by the same person must not share counters — a single
+/// running total would make one creator's leaderboard out of another's tips.
+#[test]
+fn get_jar_stats_does_not_leak_between_jars() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
 
     let owner = Address::generate(env);
     let alice = Address::generate(env);
@@ -3269,6 +3723,54 @@ fn leave_jar_reassigns_departing_share_to_last_entry() {
 
 #[test]
 fn leave_jar_when_the_last_entry_leaves() {
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &10_000);
+
+    let splits = vec![
+        env,
+        Split {
+            to: alice.clone(),
+            bps: 10000,
+        },
+    ];
+    let first = String::from_str(env, "@first");
+    let second = String::from_str(env, "@second");
+    client.create_jar(&owner, &first, &splits);
+    client.create_jar(
+        &owner,
+        &second,
+        &vec![
+            env,
+            Split {
+                to: bob.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    client.tip(&tipper, &first, &700, &String::from_str(env, "one"));
+    client.tip(&tipper, &first, &300, &String::from_str(env, "two"));
+    client.tip(&tipper, &second, &50, &String::from_str(env, "three"));
+
+    assert_eq!(
+        client.get_jar_stats(&first),
+        JarStats {
+            tip_count: 2,
+            total: 1000
+        }
+    );
+    assert_eq!(
+        client.get_jar_stats(&second),
+        JarStats {
+            tip_count: 1,
+            total: 50
+        }
+    );
+}
+
+/// A typo'd slug must not look like an untouched jar.
+#[test]
+fn get_jar_stats_on_missing_jar_fails() {
     let s = setup();
     let env = &s.env;
     let client = TipSplitterClient::new(env, &s.contract);
@@ -3277,6 +3779,26 @@ fn leave_jar_when_the_last_entry_leaves() {
     let alice = Address::generate(env);
     let bob = Address::generate(env);
     let jar_id = String::from_str(env, "@pair");
+    let res = client.try_get_jar_stats(&String::from_str(env, "@ghost"));
+    assert_eq!(res, Err(Ok(Error::JarNotFound.into())));
+}
+
+/// The counters are only an authoritative check on the indexer if a tip that
+/// never settled never reaches them. A transfer that traps reverts the whole
+/// call, including the stats writes.
+#[test]
+fn reverted_tip_leaves_both_totals_unchanged() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &1_000);
+
+    let jar_id = String::from_str(env, "@revert");
     client.create_jar(
         &owner,
         &jar_id,
@@ -3310,6 +3832,53 @@ fn leave_jar_rejects_sole_and_non_recipient() {
     let only = Address::generate(env);
     let stranger = Address::generate(env);
     let jar_id = String::from_str(env, "@only");
+                bps: 10000,
+            },
+        ],
+    );
+
+    client.tip(&tipper, &jar_id, &100, &String::from_str(env, "ok"));
+
+    // More than the remaining balance: the transfer traps.
+    let res = client.try_tip(&tipper, &jar_id, &5_000, &String::from_str(env, "nope"));
+    assert!(res.is_err(), "an unfundable tip must revert");
+
+    assert_eq!(
+        client.get_jar_stats(&jar_id),
+        JarStats {
+            tip_count: 1,
+            total: 100
+        }
+    );
+    assert_eq!(
+        client.get_supporter_stats(&jar_id, &tipper),
+        SupporterStats {
+            tip_count: 1,
+            total: 100
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #168 — per-supporter totals, the data a badge contract needs
+// ---------------------------------------------------------------------------
+
+/// A milestone check for someone who has never tipped must read zeros, not
+/// fail — the badge contract asks this of arbitrary addresses.
+#[test]
+fn get_supporter_stats_is_zero_for_an_address_that_never_tipped() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let supporter = Address::generate(env);
+    let stranger = Address::generate(env);
+    token_admin.mint(&supporter, &1_000);
+
+    let jar_id = String::from_str(env, "@badges");
     client.create_jar(
         &owner,
         &jar_id,
@@ -3317,6 +3886,7 @@ fn leave_jar_rejects_sole_and_non_recipient() {
             env,
             Split {
                 to: only.clone(),
+                to: alice.clone(),
                 bps: 10000,
             },
         ],
@@ -3340,6 +3910,46 @@ fn lock_splits_sets_flag_and_publishes_event() {
     client.create_jar(
         &owner,
         &jar_id,
+    assert_eq!(
+        client.get_supporter_stats(&jar_id, &stranger),
+        SupporterStats {
+            tip_count: 0,
+            total: 0
+        }
+    );
+
+    client.tip(&supporter, &jar_id, &100, &String::from_str(env, "hi"));
+    assert_eq!(
+        client.get_supporter_stats(&jar_id, &stranger),
+        SupporterStats {
+            tip_count: 0,
+            total: 0
+        },
+        "someone else's tip must not move a bystander's counters"
+    );
+}
+
+/// The entry is keyed by `(jar_id, supporter)`, so one supporter tipping two
+/// jars keeps two independent histories — a badge for jar A must not be won
+/// by tipping jar B.
+#[test]
+fn supporter_stats_are_independent_across_jars() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let supporter = Address::generate(env);
+    token_admin.mint(&supporter, &10_000);
+
+    let first = String::from_str(env, "@jarA");
+    let second = String::from_str(env, "@jarB");
+    client.create_jar(
+        &owner,
+        &first,
         &vec![
             env,
             Split {
@@ -3381,6 +3991,62 @@ fn locked_jar_needs_consent_only_from_decreased_recipients() {
     let owner = Address::generate(env);
     let alice = Address::generate(env);
     let bob = Address::generate(env);
+    client.create_jar(
+        &owner,
+        &second,
+        &vec![
+            env,
+            Split {
+                to: bob.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    client.tip(&supporter, &first, &1_000, &String::from_str(env, "a"));
+    client.tip(&supporter, &first, &1_000, &String::from_str(env, "b"));
+    client.tip(&supporter, &second, &250, &String::from_str(env, "c"));
+
+    assert_eq!(
+        client.get_supporter_stats(&first, &supporter),
+        SupporterStats {
+            tip_count: 2,
+            total: 2_000
+        }
+    );
+    assert_eq!(
+        client.get_supporter_stats(&second, &supporter),
+        SupporterStats {
+            tip_count: 1,
+            total: 250
+        }
+    );
+    // The jar aggregate still spans both supporters' jars.
+    assert_eq!(
+        client.get_jar_stats(&first),
+        JarStats {
+            tip_count: 2,
+            total: 2_000
+        }
+    );
+}
+
+/// Two supporters on one jar each get their own counters, and the jar's total
+/// is the sum of both.
+#[test]
+fn supporter_stats_are_independent_across_supporters() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let one = Address::generate(env);
+    let two = Address::generate(env);
+    token_admin.mint(&one, &10_000);
+    token_admin.mint(&two, &10_000);
+
     let jar_id = String::from_str(env, "@shared");
     client.create_jar(
         &owner,
@@ -3460,6 +4126,66 @@ fn unlock_requires_all_current_recipients() {
     let alice = Address::generate(env);
     let bob = Address::generate(env);
     let jar_id = String::from_str(env, "@shared");
+                bps: 10000,
+            },
+        ],
+    );
+
+    client.tip(&one, &jar_id, &1_000, &String::from_str(env, "x"));
+    client.tip(&two, &jar_id, &7, &String::from_str(env, "y"));
+    client.tip(&two, &jar_id, &7, &String::from_str(env, "z"));
+    client.tip(&two, &jar_id, &7, &String::from_str(env, "w"));
+
+    assert_eq!(
+        client.get_supporter_stats(&jar_id, &one),
+        SupporterStats {
+            tip_count: 1,
+            total: 1_000
+        }
+    );
+    assert_eq!(
+        client.get_supporter_stats(&jar_id, &two),
+        SupporterStats {
+            tip_count: 3,
+            total: 21
+        }
+    );
+    assert_eq!(
+        client.get_jar_stats(&jar_id),
+        JarStats {
+            tip_count: 4,
+            total: 1_021
+        }
+    );
+}
+
+#[test]
+fn get_supporter_stats_on_missing_jar_fails() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let supporter = Address::generate(env);
+    let res = client.try_get_supporter_stats(&String::from_str(env, "@ghost"), &supporter);
+    assert_eq!(res, Err(Ok(Error::JarNotFound.into())));
+}
+
+/// The extra writes #167 asks about are real rent, and the PR has to state
+/// their cost. Two persistent entries per tip — the jar's and the supporter's
+/// — on top of whatever the transfers themselves write.
+#[test]
+fn tip_writes_the_two_totals_entries() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &1_000);
+
+    let jar_id = String::from_str(env, "@budget");
     client.create_jar(
         &owner,
         &jar_id,
@@ -3530,6 +4256,47 @@ fn unlock_requires_all_current_recipients() {
 
 #[test]
 fn lock_survives_ownership_transfer() {
+                bps: 10000,
+            },
+        ],
+    );
+
+    client.tip(&tipper, &jar_id, &100, &String::from_str(env, "costed"));
+    let first = env.cost_estimate().resources();
+
+    // Measured against the same tip with `bump_totals` disabled: 3 write
+    // entries / 520 bytes / 2 rent bumps. The two counters add exactly two
+    // writes, 404 bytes, and two rent bumps — see `docs/CONTRACT.md`.
+    assert_eq!(
+        first.write_entries, 5,
+        "a tip writes the two totals entries plus the transfer's own three"
+    );
+    assert_eq!(
+        first.write_bytes, 924,
+        "the totals cost 404 more bytes per tip"
+    );
+    assert_eq!(
+        first.persistent_entry_rent_bumps, 4,
+        "both totals get the jar's TTL treatment, so each is bumped"
+    );
+
+    // A repeat tip to the same jar by the same supporter rewrites the same two
+    // entries, so the marginal cost per tip is flat, not growing with use.
+    client.tip(&tipper, &jar_id, &100, &String::from_str(env, "again"));
+    let second = env.cost_estimate().resources();
+    assert_eq!(
+        second.write_entries, first.write_entries,
+        "a second tip adds no ledger entries beyond the two totals writes"
+    );
+    assert_eq!(second.write_bytes, first.write_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// #169 — interface version view
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_matches_the_interface_constant() {
     let s = setup();
     let env = &s.env;
     let client = TipSplitterClient::new(env, &s.contract);
@@ -3538,6 +4305,67 @@ fn lock_survives_ownership_transfer() {
     let new_owner = Address::generate(env);
     let alice = Address::generate(env);
     let jar_id = String::from_str(env, "@keeplock");
+    assert_eq!(client.version(), INTERFACE_VERSION);
+    assert_eq!(
+        client.version(),
+        1,
+        "the published version is part of the public interface; bump \
+         INTERFACE_VERSION when the shape changes, do not edit this test \
+         to match a silent change"
+    );
+}
+
+/// The point of the view is that a client can call it before it has any jar,
+/// any token, or any authorization — reads no storage, so nothing to set up.
+#[test]
+fn version_reports_the_shape_without_reading_storage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let contract = env.register(TipSplitter, (admin, sac.address()));
+
+    let client = TipSplitterClient::new(&env, &contract);
+    assert_eq!(client.version(), INTERFACE_VERSION);
+
+    // Same answer once there is state to read, so the value is not derived
+    // from storage.
+    let owner = Address::generate(&env);
+    client.create_jar(
+        &owner,
+        &String::from_str(&env, "@v"),
+        &vec![
+            &env,
+            Split {
+                to: Address::generate(&env),
+                bps: 10000,
+            },
+        ],
+    );
+    assert_eq!(client.version(), INTERFACE_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// #170 — admin-managed token allowlist
+// ---------------------------------------------------------------------------
+
+/// A second asset, so a test can pay in something that is not the deploy-time
+/// token. Both are real Stellar Asset Contracts, which is what #170 asks the
+/// tests to use.
+fn second_asset(env: &Env, admin: &Address) -> Address {
+    env.register_stellar_asset_contract_v2(admin.clone())
+        .address()
+}
+
+/// One recipient, one jar: the fixture every allowlist test below shares.
+fn one_recipient_jar(
+    env: &Env,
+    client: &TipSplitterClient,
+    slug: &str,
+) -> (Address, Address, String) {
+    let owner = Address::generate(env);
+    let recipient = Address::generate(env);
+    let jar_id = String::from_str(env, slug);
     client.create_jar(
         &owner,
         &jar_id,
@@ -3545,6 +4373,7 @@ fn lock_survives_ownership_transfer() {
             env,
             Split {
                 to: alice.clone(),
+                to: recipient.clone(),
                 bps: 10000,
             },
         ],
@@ -3565,6 +4394,160 @@ fn recurring_tip_create_read_cancel_roundtrip() {
     let alice = Address::generate(env);
     let supporter = Address::generate(env);
     let jar_id = String::from_str(env, "@creator");
+    (owner, recipient, jar_id)
+}
+
+/// The deploy-time token is on the list from construction, so an existing
+/// deployment gains `tip_in_token` without the admin having to act, and
+/// `get_token` and `is_token_allowed` agree.
+#[test]
+fn deploy_time_token_is_allowed_by_default() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    assert!(client.is_token_allowed(&s.token));
+    assert!(!client.is_token_allowed(&Address::generate(env)));
+}
+
+#[test]
+fn admin_can_allow_and_disallow_a_token() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let eurc = second_asset(env, &s.admin);
+
+    assert!(!client.is_token_allowed(&eurc));
+    client.allow_token(&eurc);
+    assert!(client.is_token_allowed(&eurc));
+
+    client.disallow_token(&eurc);
+    assert!(!client.is_token_allowed(&eurc));
+}
+
+/// Only the admin may move the list — a jar owner who could add assets would
+/// turn the contract's allowlist into a per-jar one, and a stranger could open
+/// it to anything.
+#[test]
+fn allow_and_disallow_require_admin_auth() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let eurc = second_asset(env, &s.admin);
+    let attacker = Address::generate(env);
+
+    env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "allow_token",
+            args: (eurc.clone(),).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(
+        client.try_allow_token(&eurc).is_err(),
+        "a non-admin must not be able to widen the allowlist"
+    );
+    assert!(!client.is_token_allowed(&eurc));
+
+    env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "disallow_token",
+            args: (eurc.clone(),).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(
+        client.try_disallow_token(&eurc).is_err(),
+        "a non-admin must not be able to narrow the allowlist"
+    );
+}
+
+/// Each change publishes an event naming the token and the admin who
+/// authorised it, so an index of accepted assets has provenance.
+#[test]
+fn allow_and_disallow_emit_events_naming_token_and_admin() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let eurc = second_asset(env, &s.admin);
+
+    client.allow_token(&eurc.clone());
+    let allow_topics = vec![
+        env,
+        symbol_short!("tk_allow").into_val(env),
+        eurc.clone().into_val(env),
+    ];
+    let ev: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract && e.1 == allow_topics)
+        .collect();
+    assert_eq!(ev.len(), 1, "allow_token must emit exactly one event");
+    let who: Address = TryFromVal::try_from_val(env, &ev.first().unwrap().2)
+        .expect("allow event carries the authorising admin");
+    assert_eq!(who, s.admin);
+
+    client.disallow_token(&eurc.clone());
+    let dis_topics = vec![
+        env,
+        symbol_short!("tk_dis").into_val(env),
+        eurc.clone().into_val(env),
+    ];
+    let ev: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract && e.1 == dis_topics)
+        .collect();
+    assert_eq!(ev.len(), 1, "disallow_token must emit exactly one event");
+}
+
+/// `tip` always pays through the deploy-time token, so removing it from the
+/// list would leave a working tip path for a token the view calls closed.
+#[test]
+fn disallow_rejects_the_default_token() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    assert_eq!(
+        client.try_disallow_token(&s.token),
+        Err(Ok(Error::CannotDisallowDefault.into()))
+    );
+    assert!(
+        client.is_token_allowed(&s.token),
+        "the default token stays allowed"
+    );
+}
+
+/// The split must not depend on the asset: an EURC tip of 100 pays 70/30
+/// exactly as a USDC tip of 100 does, because `compute_shares` is amount-only.
+#[test]
+fn tip_in_token_splits_identically_to_the_default_token() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let usdc = token::Client::new(env, &s.token);
+    let usdc_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let eurc = second_asset(env, &s.admin);
+    let eurc_client = token::Client::new(env, &eurc);
+    let eurc_admin = token::StellarAssetClient::new(env, &eurc);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    usdc_admin.mint(&tipper, &1_000);
+    eurc_admin.mint(&tipper, &1_000);
+    client.allow_token(&eurc);
+
+    let jar_id = String::from_str(env, "@multi");
     client.create_jar(
         &owner,
         &jar_id,
@@ -3608,6 +4591,59 @@ fn recurring_tip_validation() {
     let alice = Address::generate(env);
     let supporter = Address::generate(env);
     let jar_id = String::from_str(env, "@v");
+                bps: 7000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 3000,
+            },
+        ],
+    );
+
+    client.tip(&tipper, &jar_id, &100, &String::from_str(env, "in usdc"));
+    assert_eq!(usdc.balance(&alice), 70);
+    assert_eq!(usdc.balance(&bob), 30);
+
+    client.tip_in_token(
+        &tipper,
+        &jar_id,
+        &eurc,
+        &100,
+        &String::from_str(env, "in eurc"),
+    );
+    assert_eq!(eurc_client.balance(&alice), 70);
+    assert_eq!(eurc_client.balance(&bob), 30);
+    assert_eq!(usdc.balance(&alice), 70, "the assets do not mix");
+
+    // Both tips counted, in the same raw units.
+    assert_eq!(
+        client.get_jar_stats(&jar_id),
+        JarStats {
+            tip_count: 2,
+            total: 200
+        }
+    );
+}
+
+/// An unlisted token is rejected before funds move.
+#[test]
+fn tip_in_token_rejects_a_disallowed_token_before_funds_move() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let usdc_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let eurc = second_asset(env, &s.admin);
+    let eurc_client = token::Client::new(env, &eurc);
+    let eurc_admin = token::StellarAssetClient::new(env, &eurc);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    usdc_admin.mint(&tipper, &1_000);
+    eurc_admin.mint(&tipper, &1_000);
+
+    let jar_id = String::from_str(env, "@closed");
     client.create_jar(
         &owner,
         &jar_id,
@@ -3650,6 +4686,114 @@ fn cancel_recurring_requires_the_supporter() {
     let alice = Address::generate(env);
     let supporter = Address::generate(env);
     let jar_id = String::from_str(env, "@own");
+    assert_eq!(
+        client.try_tip_in_token(
+            &tipper,
+            &jar_id,
+            &eurc,
+            &100,
+            &String::from_str(env, "nope")
+        ),
+        Err(Ok(Error::TokenNotAllowed.into()))
+    );
+    assert_eq!(eurc_client.balance(&alice), 0);
+    assert_eq!(eurc_client.balance(&tipper), 1_000);
+    assert_eq!(
+        client.get_jar_stats(&jar_id),
+        JarStats {
+            tip_count: 0,
+            total: 0
+        },
+        "a rejected token must not be counted"
+    );
+
+    // Allowed, tipped, then disallowed: the third tip is rejected again.
+    client.allow_token(&eurc);
+    client.tip_in_token(&tipper, &jar_id, &eurc, &100, &String::from_str(env, "yes"));
+    client.disallow_token(&eurc);
+    assert_eq!(
+        client.try_tip_in_token(
+            &tipper,
+            &jar_id,
+            &eurc,
+            &100,
+            &String::from_str(env, "closed")
+        ),
+        Err(Ok(Error::TokenNotAllowed.into()))
+    );
+    assert_eq!(eurc_client.balance(&alice), 100);
+}
+
+/// The event has to say which asset moved, or an indexer cannot tell 10 USDC
+/// from 10 XLM.
+#[test]
+fn tip_event_names_the_token_paid_in() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let eurc = second_asset(env, &s.admin);
+    let eurc_admin = token::StellarAssetClient::new(env, &eurc);
+    client.allow_token(&eurc);
+
+    let (_owner, recipient, jar_id) = one_recipient_jar(env, &client, "@evt");
+    let tipper = Address::generate(env);
+    eurc_admin.mint(&tipper, &1_000);
+
+    client.tip_in_token(
+        &tipper,
+        &jar_id,
+        &eurc,
+        &400,
+        &String::from_str(env, "in another asset"),
+    );
+
+    let expected_topics = vec![
+        env,
+        symbol_short!("tip").into_val(env),
+        jar_id.clone().into_val(env),
+    ];
+    let ev: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract && e.1 == expected_topics)
+        .collect();
+    assert_eq!(ev.len(), 1);
+    let (from, amount, _message, breakdown, token_paid): (
+        Address,
+        i128,
+        String,
+        Vec<(Address, i128)>,
+        Address,
+    ) = TryFromVal::try_from_val(env, &ev.first().unwrap().2).expect("tip event data shape");
+    assert_eq!(token_paid, eurc, "the event must name the asset paid in");
+    assert_eq!(from, tipper);
+    assert_eq!(amount, 400);
+    assert_eq!(breakdown.len(), 1);
+    assert_eq!(breakdown.get(0).unwrap(), (recipient, 400));
+}
+
+/// The recorded decision for #170: the minimum is a raw, unitless number, so
+/// it gates the default token only. A tip in another allowed asset is not
+/// subject to it.
+#[test]
+fn minimum_tip_gates_the_default_token_only() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let usdc_admin = token::StellarAssetClient::new(env, &s.token);
+    let eurc = second_asset(env, &s.admin);
+    let eurc_admin = token::StellarAssetClient::new(env, &eurc);
+    let eurc_client = token::Client::new(env, &eurc);
+    client.allow_token(&eurc);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    usdc_admin.mint(&tipper, &10_000);
+    eurc_admin.mint(&tipper, &10_000);
+
+    let jar_id = String::from_str(env, "@floored");
     client.create_jar(
         &owner,
         &jar_id,
@@ -3669,4 +4813,34 @@ fn cancel_recurring_requires_the_supporter() {
     assert!(client.try_cancel_recurring(&id).is_err());
     // still present
     assert_eq!(client.get_recurring(&id).supporter, supporter);
+    client.set_min_tip_amount(&jar_id, &Some(500_i128));
+
+    // Default token: the floor holds.
+    assert_eq!(
+        client.try_tip(&tipper, &jar_id, &499, &String::from_str(env, "under")),
+        Err(Ok(Error::BelowMinTipAmount.into()))
+    );
+    client.tip(
+        &tipper,
+        &jar_id,
+        &500,
+        &String::from_str(env, "at the floor"),
+    );
+
+    // Other allowed asset: same jar, same minimum, not enforced — the number
+    // has no unit to compare against.
+    client.tip_in_token(
+        &tipper,
+        &jar_id,
+        &eurc,
+        &1,
+        &String::from_str(env, "tiny eurc"),
+    );
+    assert_eq!(eurc_client.balance(&alice), 1);
+
+    // ...unless the call names the default token, where it still applies.
+    assert_eq!(
+        client.try_tip_in_token(&tipper, &jar_id, &s.token, &2, &String::from_str(env, "x")),
+        Err(Ok(Error::BelowMinTipAmount.into()))
+    );
 }

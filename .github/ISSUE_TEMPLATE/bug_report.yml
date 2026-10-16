@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a reproducible problem with the contract, a script, or the CLI workflow
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A report that leaves out the network, the contract id, the CLI version
+        or the exact command usually cannot be reproduced. Please fill in every
+        required field. If your issue is a security problem, do not open a
+        public issue — see the reporting policy in `CONTRIBUTING.md`.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong, in one or two sentences.
+      placeholder: tip() reverts with Error(Contract, #13) even though the recipient has a trustline
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      description: Which network did you run this on?
+      options:
+        - testnet
+        - mainnet
+        - local
+    validations:
+      required: true
+  - type: input
+    id: contract-id
+    attributes:
+      label: Contract id
+      description: The C... id of the tip_splitter deployment you hit this against (the contents of .contract-id).
+      placeholder: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB6
+    validations:
+      required: true
+  - type: input
+    id: cli-version
+    attributes:
+      label: Stellar CLI version
+      description: "Output of `stellar --version`."
+      placeholder: stellar 22.1.3
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run
+      description: The exact command (or script invocation with its env vars redacted of secrets) that triggered the problem.
+      render: shell
+      placeholder: |
+        set -a; source .env; set +a
+        ./scripts/create-jar.sh
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Full output
+      description: The complete stdout and stderr — not a paraphrase. Truncate only obvious repeats.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual behaviour
+      description: What you expected to happen, what happened instead, and — if you have one — the smallest variation of the command that does not fail.
+    validations:
+      required: false

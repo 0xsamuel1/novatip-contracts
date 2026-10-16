@@ -5,6 +5,147 @@ All notable changes to `novatip-contracts` are documented here.
 ## [Unreleased]
 
 ### Added
+- `version() -> u32` returns `INTERFACE_VERSION`, a compile-time constant that
+  is bumped whenever the public interface changes shape (#169). A client that
+  knows only a contract id can now ask which build it is talking to instead of
+  discovering a mismatch when an event fails to decode. It reads no storage, so
+  it works against a contract that has no jars. Initial value `1`
+- `get_jar_stats(jar_id) -> JarStats { tip_count, total }` and
+  `get_supporter_stats(jar_id, supporter) -> SupporterStats` report tip totals
+  kept on-chain, bumped inside the tip that pays out (#167, #168). The jar
+  counters give an authoritative figure to compare the indexer against —
+  `planBatch` skips any ledger that returns a full page of events, and an event
+  older than the RPC's retention window can never be backfilled, so a missed
+  tip previously lowered a creator's totals with nothing to contradict it. The
+  supporter counters are the data the planned `supporter_badge` contract needs
+  to verify a milestone without trusting an off-chain service. Both read zeros
+  for a jar or address that has not been tipped, and `JarNotFound` for a free
+  slug
+- `allow_token(token)` / `disallow_token(token)`, `is_token_allowed(token)`,
+  and `tip_in_token(from, jar_id, token, amount, message)` (#170). The admin
+  manages an allowlist of assets tips may be paid in, so a supporter holding
+  EURC no longer has to swap into the deploy-time token first. The allowlist is
+  checked before any transfer, so an unlisted token fails with
+  `TokenNotAllowed` and moves nothing; the split arithmetic is shared with
+  `tip`, so an EURC tip of 100 pays 70/30 exactly as a USDC tip of 100 does.
+  `tip` itself is unchanged — it settles in `get_token()`, which the
+  constructor allowlists — so existing integrations keep working.
+  `disallow_token` refuses the default token with `CannotDisallowDefault`
+- Error codes 14 `TokenNotAllowed`, 15 `CannotDisallowDefault` and 16
+  `StatsOverflow`, appended so existing codes keep their values
+
+### Changed (breaking: event payload)
+- The `tip` event's data tuple gained a fifth element, `token: Address`, naming
+  the asset the tip was paid in. Without it an indexer cannot tell 10 USDC from
+  10 XLM, and a jar tipped in two assets would have its totals summed across
+  them as one currency. `decodeTipEvent` in `@novatip/sdk` and the backend
+  indexer must accept the fifth element before reading events from a contract
+  built from this version; the first four keep their positions and meaning, so
+  a consumer ignoring trailing elements is unaffected. `version()` is how a
+  client detects this in advance
+
+### Decisions
+- The per-jar minimum from `set_min_tip_amount` is a raw `i128` with no unit, so
+  it now applies to the default token only: a tip in another allowed asset is
+  not gated by it. Making it per-token would change that function's signature
+  and storage key, breaking every jar that already configured a minimum. The
+  trade-off is stated in `docs/CONTRACT.md` — a jar can be tipped below its
+  floor in another asset, so a creator who cares keeps the allowlist to one
+  token
+- The allowlist lives in instance storage beside `Admin` and `Token`. A
+  persistent entry nobody touches is archived silently, which would present as
+  "this token stopped working" with no admin action behind it
+
+### Costs
+- A tip now performs two extra persistent writes (the jar's and the
+  supporter's totals) and two extra rent bumps: 5 ledger writes and 924 bytes
+  instead of 3 and 520, roughly +25% modelled CPU, measured by
+  `tip_writes_the_two_totals_entries`. The difference is flat — a repeat tip
+  rewrites the same two entries and adds none
+
+### Added
+- `tip` returns the tip's sequence number and every successful tip increments a
+  contract-wide `u64`, published as the fifth element of the `tip` event. A
+  consumer can now order tips and prove it has seen all of them, which the
+  transaction hash could not do: two tips in one batched transaction share a
+  hash, and an indexer upserting on it dropped every one after the first.
+  `get_tip_count() -> u64` exposes the running total (`0` on a fresh deploy) as a
+  cheap completeness check
+- `tip_with_ref(from, jar_id, amount, message, reference)` — the same tip with an
+  optional opaque 32-byte client reference echoed in the `tip` event, so an
+  integration that created something off-chain (a checkout session, a bot
+  command, a pending alert) can match the event back to it. The contract neither
+  stores it nor enforces uniqueness; omitting it costs nothing. `tip` keeps its
+  existing signature and publishes an explicit `None` in the same position, and
+  both entry points share one internal implementation so they cannot drift
+- `scripts/transfer-jar.sh` and `scripts/set-min-tip.sh` cover the two remaining
+  jar-owner calls, which until now had to be assembled as `stellar contract
+  invoke` commands by hand. `set-min-tip.sh` clears a minimum by omitting
+  `--min_amount` entirely — the only spelling of `Option::None` the CLI accepts —
+  and rejects zero, negative and non-numeric amounts locally, before paying for a
+  network call. `.env.example` documents `NEW_OWNER` and `MIN_TIP`, and the
+  README gained a scripts section
+- `docs/CONTRACT.md` gained an **Authorization** section describing what a
+  signature actually commits to: a tipper authorizes the `tip` call plus one
+  token transfer per paid recipient, with the exact recipient and amount. That
+  explains why wallets show N transfers rather than one payment to the contract,
+  why a tip signed against old splits fails with `Error(Context, InvalidAction)`
+  once `update_splits` lands (so an owner cannot redirect a tip in flight), and
+  that the client's recovery is to re-simulate and re-sign rather than retry
+
+### Changed (breaking: event payload)
+- `scripts/update-splits.sh` replaces a jar's splits with the same local
+  validation `create-jar.sh` applies (both now share `scripts/lib/splits.sh`).
+  It prints the old and new splits before sending, refuses unchanged splits,
+  and refuses to sign when `SOURCE` is not the jar's owner
+- `scripts/jar-info.sh`, a read-only inspector: owner, each recipient with its
+  share as a percentage, the minimum tip, and — with `AMOUNT` set — what a tip
+  of that size pays each recipient (`preview_split`). It submits nothing
+- `scripts/check-docs.sh` (`make check-docs`, CI step `docs-check`) builds the
+  contract and fails when `docs/CONTRACT.md`'s function or error tables no
+  longer match the built interface — missing or extra entries, or an error
+  documented with a different number
+- `scripts/lib/env.sh`, sourced by every script: loads the repository-root
+  `.env` (exported variables win), cds to the repo root so scripts work from
+  any directory, and reports missing settings by name
+
+### Changed
+- `make deploy` and `scripts/*.sh` no longer require a manual
+  `set -a; source .env; set +a`; `.env.example` documents the optional
+  `CONTRACT_ID` override and the testnet/mainnet USDC SAC ids
+
+### Added
+- `scripts/events.sh` lists the contract's published events with topic filters
+  computed via `stellar xdr encode --type ScVal` instead of hand-encoded
+  base64. Takes `EVENT` (one of the five event names or `all`), optional
+  `SLUG`, and an optional ledger window, and explains the RPC's event
+  retention when a start ledger is too old
+- `scripts/trustline.sh` adds the USDC trustline every classic account needs
+  to tip or receive tips, deriving the classic `CODE:ISSUER` line from
+  `USDC_TOKEN`'s own `name()`. Idempotent (accounts that already have the
+  line are skipped); `--check` with `SLUG` reports a jar's recipients that
+  cannot receive a tip and exits non-zero. Its usage comment and
+  `docs/CONTRACT.md` explain where testnet USDC comes from
+- `examples/tip-forwarder`: a worked example of `tip_splitter` called from
+  another contract — the caller must pre-authorize each per-recipient
+  `transfer` with `env.authorize_as_current_contract`, and the amounts differ
+  from `preview_split` when the caller is itself a recipient. Tests run the
+  real `TipSplitter` and a test SAC under strict `mock_auths`; the interface
+  is declared with a local `#[contractclient]` so `cargo test` needs no built
+  wasm
+- `.github/`: issue forms (`bug_report.yml` requiring network, contract id,
+  CLI version, command and full output; `feature_request.yml`), `config.yml`
+  disabling blank issues and routing security reports to the private channel,
+  and a pull request template with interface/changelog/consumer-impact
+  checks
+- `docs/CONTRACT.md` gains "Calling from another contract", "USDC
+  trustlines" and "Inspecting events" sections
+- `InsufficientBalance` (code 14, appended so existing codes are unchanged).
+  `tip` reads the sender's token balance once before the first transfer and
+  fails with this code when `balance < amount`, instead of letting the SAC's
+  overlapping `BalanceError` (code 10) propagate as `SplitsEmpty`. Other token
+  failures (missing or frozen trustline, allowance overflow) still surface
+  with the token's own number — see `docs/CONTRACT.md`
 - `get_limits() -> Limits` returns `bps_denom`, `max_recipients` and
   `max_message_len`, so clients read the bounds from the contract they are
   talking to instead of hardcoding their own copy
@@ -14,6 +155,13 @@ All notable changes to `novatip-contracts` are documented here.
   quiet `false`
 
 ### Changed (breaking: event payload)
+- The `tip` event's data tuple grew from four elements to six: `seq: u64` and
+  `reference: Option<BytesN<32>>` were appended after `breakdown`. A positional
+  decoder (`decodeTipEvent` in `@novatip/sdk`, the backend indexer) must accept
+  both before reading events from a contract built from this version; the first
+  four elements keep their positions, so a consumer that ignores trailing
+  elements is unaffected. Neither joins the topics, because the SDK's
+  `tipTopicFilter` requires exactly one segment per published topic
 - The `tip` event's data tuple gained a fourth element, `breakdown:
   Vec<(Address, i128)>`, listing each recipient and the amount they were
   actually paid in split order. An indexer no longer has to fetch the jar and
@@ -115,7 +263,8 @@ All notable changes to `novatip-contracts` are documented here.
   this unreleased cycle, so never shipped in a release — are gone: the vector
   grew without bound and made each `create_jar` cost more than the last.
   Indexers reconstruct the jar list by scanning `jar_crtd` events; see
-  [`docs/CONTRACT.md`](docs/CONTRACT.md) for the backfill procedure.
+  [`docs/CONTRACT.md`](docs/CONTRACT.md) for how discovery works and how to find
+  jars created before a build emitted `jar_crtd`.
 - `validate_splits()` now rejects any split with `bps == 0` (`InvalidSplits`).
   Such a recipient could never be paid but still consumed one of the 20
   recipient slots and appeared in clients as a collaborator. This applies to
