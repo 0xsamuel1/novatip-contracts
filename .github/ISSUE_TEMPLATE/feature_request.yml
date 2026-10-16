@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a new contract capability, script, tooling or documentation
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repo keeps its public interface (functions, error codes, event
+        payloads) in `docs/CONTRACT.md`. A feature request is easiest to accept
+        when it says who the missing capability is for and what they cannot do
+        today.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem this solves
+      description: Who hits what, when, and why the current workaround is not enough. A concrete failing command or a linked issue beats a general statement.
+      placeholder: Integrators calling tip() from another contract must hand-encode auth entries; nothing in the repo shows how.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: The function, script, event, or docs section you have in mind — names and signatures included if you can.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: What does it touch?
+      multiple: true
+      options:
+        - Contract (lib.rs) — new or changed function
+        - Contract — new or changed event
+        - Contract — new error code
+        - scripts/
+        - docs/
+        - CI / tooling
+        - Tests / examples
+    validations:
+      required: true
+  - type: textarea
+    id: interface-impact
+    attributes:
+      label: Interface impact
+      description: For contract changes — does docs/CONTRACT.md, CHANGELOG.md, @novatip/sdk, or the backend indexer need an update? Note any consumer impact for new or changed events.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve the same problem, and why they fall short.
+    validations:
+      required: false

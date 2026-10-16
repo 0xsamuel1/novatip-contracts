@@ -503,3 +503,65 @@ set -a; source .env; set +a
 ```
 
 See [`.env.example`](../.env.example) for required variables.
+
+### USDC trustlines
+
+Every classic `G...` account that sends **or receives** a tip needs a trustline
+to the settlement asset first, and tips are all-or-nothing — one recipient
+without a line fails the whole tip with the token's `Error(Contract, #13)`.
+`scripts/trustline.sh` adds the line for the identities in `IDENTITIES`,
+deriving the classic asset (`USDC:<issuer>`) from `USDC_TOKEN` itself, and
+skips accounts that already have one. With `SLUG` set it also checks the jar's
+recipients; `--check` reports without changing anything and exits non-zero if
+anyone cannot be paid:
+
+```bash
+IDENTITIES="tipper alice bob" ./scripts/trustline.sh          # add lines
+SLUG=@demo ./scripts/trustline.sh --check                     # report only
+```
+
+Testnet USDC is issued by the account encoded in the derived asset name
+(`USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`
+on testnet). There is no on-chain claim — fund an account by payment from a
+holder (see the usage comment at the top of `scripts/trustline.sh`), after
+`stellar fund` covers the XLM reserves.
+
+### Inspecting events
+
+When an indexer misses something, the first question is whether the event was
+ever emitted. `scripts/events.sh` computes the topic filters with
+`stellar xdr encode --type ScVal` instead of hand-rolled base64 (a wrong
+encoding fails loudly, a wrong segment count silently returns nothing — see
+the encoding walkthrough in the issues thread #57):
+
+```bash
+EVENT=tip SLUG=@demo ./scripts/events.sh   # tips to one jar
+EVENT=all ./scripts/events.sh              # every event type, recent window
+```
+
+It lists each of the five event types (`jar_crtd`, `splits`, `jar_xfer`,
+`min_tip`, `tip`), one line per event with ledger, name, jar id and decoded
+payload, defaulting to a recent ledger window; a `START_LEDGER` outside the
+RPC's retention window gets an explanatory error. Sample output is in the
+script's usage comment.
+
+## Calling from another contract
+
+`tip` authorizes `from` with `from.require_auth()`, which a calling contract
+satisfies automatically — but the per-recipient `transfer(from, …)` calls it
+then makes are invoked by `tip_splitter`, not by the caller, so they are not
+covered. A contract tipping from its own balance must pre-authorize each
+transfer with `env.authorize_as_current_contract`, listing every recipient and
+the exact amount, or the tip fails with an auth error.
+
+The amounts to authorize are what `preview_split(jar_id, amount)` returns, with
+one exception: if the calling contract is itself a recipient, `tip` skips the
+self-transfer and rolls that share into the last recipient, so authorize
+`preview_split`'s values **minus** the contract's own entry, plus the same
+amount on the final recipient.
+
+`examples/tip-forwarder` is a worked example of exactly this — one function
+that tips a jar from the contract's own balance — with tests that run it
+against the real `TipSplitter` and a test SAC, including the failure mode where
+the authorized amounts do not match the jar's splits. See its
+[`README.md`](../examples/tip-forwarder/README.md).

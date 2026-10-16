@@ -1,0 +1,18 @@
+[package]
+name = "tip-forwarder"
+version = "0.0.0"
+edition = "2021"
+# Matches the workspace MSRV pin so the resolver keeps deps parseable.
+rust-version = "1.84"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+tip-splitter = { path = "../../contracts/tip-splitter" }
