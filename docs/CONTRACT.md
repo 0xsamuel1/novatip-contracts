@@ -1,7 +1,9 @@
 # `tip_splitter` — contract interface
 
 Receives a single USDC tip and splits it across one or more recipients by
-basis-point shares, atomically, in one transaction.
+basis-point shares, in one transaction. A recipient who cannot receive the token
+no longer blocks the others: their share is escrowed by the contract for later
+withdrawal.
 
 ## Concepts
 
@@ -27,6 +29,13 @@ basis-point shares, atomically, in one transaction.
 ## Types
 
 ```rust
+struct Split    { to: Address, bps: u32 }
+struct Jar      { owner: Address, splits: Vec<Split>, locked: bool }
+struct Limits   { bps_denom: u32, max_recipients: u32, max_message_len: u32 }
+struct Recurring {
+    supporter: Address, jar_id: String, amount: i128,
+    period_ledgers: u32, message: String, next_due_ledger: u32,
+}
 struct Split          { to: Address, bps: u32 }
 struct Jar            { owner: Address, splits: Vec<Split> }
 struct Limits         { bps_denom: u32, max_recipients: u32, max_message_len: u32 }
@@ -44,9 +53,19 @@ one belongs to a jar, the other to a `(jar, supporter)` pair.
 |----------|------|-------------|
 | `__constructor(admin, token)` | — | Deploy-time init. Stores the admin and USDC token address, and puts that token on the tip allowlist as its first entry. |
 | `create_jar(owner, jar_id, splits)` | `owner` | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. |
-| `update_splits(jar_id, splits)` | jar `owner` | Replace a jar's splits. Subject to the same validation as `create_jar`. Emits a `splits` event. |
+| `update_splits(jar_id, splits)` | jar `owner`, plus every current recipient whose share **decreases or is removed** when the jar is locked | Replace a jar's splits. Subject to the same validation as `create_jar`. On a locked jar the owner alone cannot cut a collaborator — see [`lock_splits`](#locking-a-jars-splits). Emits a `splits` event. |
+| `lock_splits(jar_id)` | jar `owner` | Lock a jar so `update_splits` needs each reduced/removed recipient's consent. Emits a `lock` event with data `true`. |
+| `unlock_splits(jar_id)` | jar `owner` **and every current recipient** | Remove the lock. Consent mirrors a reduction: all recipients must sign, or the owner could disarm the lock and then cut shares. Emits a `lock` event with data `false`. |
+| `is_splits_locked(jar_id) -> bool` | — | Whether the jar's splits are locked. Panics with `JarNotFound` if the slug is free. |
+| `leave_jar(jar_id, recipient)` | `recipient` | Remove `recipient` from the jar's splits. Their share is added to the last remaining entry so the splits still sum to 10 000. Rejected with `SoleRecipient` (only entry) or `NotRecipient` (not in the jar). Emits a `splits` event. |
 | `set_min_tip_amount(jar_id, min_amount)` | jar `owner` | Set or clear an optional minimum tip amount for a jar. `min_amount` must be strictly positive (`> 0`) or `None` to clear. Emits a `min_tip` event. |
 | `transfer_jar_ownership(jar_id, new_owner)` | current jar `owner` | Hand control of a jar to `new_owner`. Splits are unchanged; the new owner does not need to authorize. Emits a `jar_xfer` event carrying both owners. |
+| `tip(from, jar_id, amount, message)` | `from` | Move `amount` USDC out of `from` and route it across the jar's recipients. A recipient who cannot receive the token has their share **escrowed in the contract** (see `get_held`/`withdraw_held`) instead of reverting the tip. Emits a `tip` event carrying the per-recipient breakdown. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
+| `get_held(recipient) -> i128` | — | How much the contract is holding for `recipient` because a past tip could not deliver their share. `0` when nothing is held. |
+| `withdraw_held(recipient)` | `recipient` | Pay a recipient their held balance once they can receive again. Rejected with `NothingHeld` when nothing is owed. Emits a `withdraw` event. |
+| `create_recurring(supporter, jar_id, amount, period_ledgers, message) -> u128` | `supporter` | Register a recurring-tip **record** (no funds move). Validates the jar exists and the amount/message pass the same checks `tip` applies; `period_ledgers` must be non-zero. Assigns a fresh id, stores the entry with its first `next_due_ledger`, and emits a `recr_add` event. Returns the id. |
+| `cancel_recurring(id)` | the entry's `supporter` | Remove a recurring-tip record. Emits a `recr_del` event. |
+| `get_recurring(id) -> Recurring` | — | Read a stored recurring-tip entry. Panics with `RecurringNotFound` for an unknown id. |
 | `tip(from, jar_id, amount, message)` | `from` | Transfer `amount` of the **default token** from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown and the token paid in. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
 | `tip_in_token(from, jar_id, token, amount, message)` | `from` | Same split, paid in `token`, which must be on the allowlist — otherwise `TokenNotAllowed`, raised before any transfer. The jar minimum applies only when `token` is the default token. Emits the same `tip` event. |
 | `allow_token(token)` | contract `admin` | Add `token` to the allowlist. Idempotent. Emits a `tk_allow` event carrying the admin who authorised it. |
@@ -335,13 +354,24 @@ the code, so flipping that profile setting cannot turn it into a bypass.
 - Each non-final recipient receives `amount * bps / 10_000` (integer division).
 - The **last** recipient receives `amount - (sum of prior shares)`, so rounding
   dust is never lost and the full amount is always distributed.
-- The whole tip reverts if any single transfer fails — tips are all-or-nothing.
+- A tip is **not** all-or-nothing. Each recipient is delivered with
+  `try_transfer`; a recipient who cannot receive the token (a dropped trustline
+  or a deauthorised account) has their share moved from the tipper into the
+  contract and credited under `DataKey::Held(recipient)`. Everyone else is paid
+  normally and the tip still succeeds. `withdraw_held` releases the escrow once
+  the recipient can receive again.
 - `preview_split(jar_id, amount)` runs this same calculation as a view, so a
   client can show the exact per-recipient amounts before the supporter signs.
 - The amounts actually transferred are published in the `tip` event's
   `breakdown`, so no consumer has to reproduce this arithmetic after the fact
   either.
 
+> **Trust implication (escrow).** Holding an undeliverable share means the
+> contract temporarily custodies tokens it did not before — the previous
+> all-or-nothing design let the contract hold no balance. The contract account
+> must therefore be able to hold the jar token (a trustline / authorized account
+> on the asset), and a held share is only ever claimable by the recipient it is
+> credited to. The tipper is debited the full amount either way.
 ## Authorization
 
 Every function that names an address in its signature requires that address's
@@ -425,6 +455,11 @@ slug names at submission time.
 | 15 | `CannotDisallowDefault` | `disallow_token` was given the deploy-time token, which `tip` always pays through and which therefore stays non-removable. |
 | 16 | `StatsOverflow` | A running tip total would not fit `u64`/`i128`. Effectively unreachable; the counters use checked arithmetic so an exhaustion reports as this code rather than a wasm trap. |
 | 13 | `BelowMinTipAmount` | Tip amount is strictly below the jar's configured minimum tip amount. Raised by `tip` and `preview_split`. |
+| 14 | `NotRecipient` | `leave_jar` was called for an address not present in the jar's splits. |
+| 15 | `SoleRecipient` | `leave_jar` would empty the jar — the caller is its only recipient. |
+| 16 | `RecurringNotFound` | `cancel_recurring` / `get_recurring` named an id that does not exist. |
+| 17 | `InvalidPeriod` | A recurring tip was registered with a zero `period_ledgers` (or its due-ledger computation would overflow). |
+| 18 | `NothingHeld` | `withdraw_held` was called for a recipient the contract holds nothing for. |
 | 14 | `InsufficientBalance` | Tip amount exceeds the sender's USDC balance. Checked once per `tip`, before any transfer. |
 
 Error codes are part of the public interface: `@novatip/sdk` and the frontend
@@ -525,6 +560,7 @@ Lets indexers track the current minimum tip floor for a jar without polling `get
 ### `tip` — published on every successful tip
 
 - **Topics:** `(symbol "tip", jar_id: String)`
+- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128, bool)>)`
 - **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128)>, token: Address)`
 - **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128)>, seq: u64, reference: Option<BytesN<32>>)`
 
@@ -532,6 +568,8 @@ The backend indexer subscribes to this event to update balances, leaderboards,
 and notifications. `message` is at most 280 bytes, so the payload size is
 bounded and a `varchar(280)` column is enough to store it.
 
+`breakdown` lists one `(recipient, moved, held)` triple per split, **in split
+order**, so the event is self-describing: a consumer that wants per-collaborator
 The six elements occupy fixed, documented positions, in the order above, and
 that order is part of the public interface: `from`, `amount`, `message` and
 `breakdown` keep the positions they had, and `seq` and `reference` were appended.
@@ -545,7 +583,12 @@ earnings never has to fetch the jar and redo the arithmetic. That matters
 because a recomputed figure can disagree with the contract's — the jar's splits
 may have been changed by `update_splits` between the tip and the read, and the
 last recipient's share includes rounding dust that depends on the exact
-amount. The amounts always sum to `amount`.
+amount. The `moved` values always sum to `amount`.
+
+The `held` flag distinguishes a **delivered** share (`false`) from one the
+contract could not deliver and has escrowed for later withdrawal (`true`, #171).
+For a held triple, `moved` is the amount the contract took into custody for that
+recipient.
 
 The pairs report **what each transfer actually moved**, not the notional
 `amount * bps / 10_000` that [`preview_split`](#previewing-a-tip) quotes. The
@@ -564,6 +607,68 @@ Note that `breakdown` is a snapshot, not the jar's current state. To ask
 whether an address is a recipient *now*, use
 [`is_recipient`](#confirming-you-are-a-recipient).
 
+> **Consumer impact.** The outer data tuple keeps its four elements
+> (`from, amount, message, breakdown`), but each `breakdown` entry is now a
+> **triple** `(recipient, moved, held)` rather than a pair — the extra `held`
+> flag marks a share the contract escrowed instead of delivering (#171).
+> `decodeTipEvent` in `@novatip/sdk` and the backend indexer must read the third
+> element of each breakdown entry before consuming events from a contract built
+> from this version. A recipient who cannot receive no longer aborts the whole
+> tip, so indexers that assumed all-or-nothing must treat `held = true` entries
+> as escrowed (claimable via `withdraw_held`) rather than as failures.
+
+### `lock` — published on `lock_splits` and `unlock_splits`
+
+- **Topics:** `(symbol "lock", jar_id: String)`
+- **Data:** `locked: bool` (`true` when locked, `false` when unlocked)
+
+Lets an indexer cache whether a jar protects its collaborators against a
+unilateral owner edit (#173).
+
+### `withdraw` — published on every successful `withdraw_held`
+
+- **Topics:** `(symbol "withdraw", recipient: Address)`
+- **Data:** `amount: i128`
+
+Records the moment an escrowed share (#171) is released to its recipient. The
+recipient is a topic (not just data) so an indexer can subscribe to one
+address's withdrawals.
+
+### `recr_add` / `recr_del` — recurring-tip registration and cancellation
+
+- **`recr_add` Topics:** `(symbol "recr_add", supporter: Address)`, **Data:** `id: u128`
+- **`recr_del` Topics:** `(symbol "recr_del", supporter: Address)`, **Data:** `id: u128`
+
+Publishes the assigned schedule id. A recurring tip is a **record**, not a
+payment — a due schedule still results in an ordinary `tip`; automatic
+collection is out of scope (it needs the supporter to approve the contract as a
+token spender).
+
+> The `splits` event is also emitted by `leave_jar` (#172), not only by
+> `update_splits`, so an indexer refreshes its cached splits after a recipient
+> removes themselves.
+
+## Locking a jar's splits
+
+`lock_splits(jar_id)` turns a jar from the owner's alone into an agreement
+between collaborators. Once locked, `update_splits` no longer accepts the
+owner's signature by itself: **every current recipient whose share decreases or
+who is removed must also authorize.** Recipients who are unchanged or increased,
+and newly added recipients, do not sign — the lock only guards against being cut
+out behind your back.
+
+`unlock_splits(jar_id)` restores unilateral owner control, and because unlocking
+re-enables reductions it requires authorization from **all** current recipients,
+not just the owner; otherwise an owner could disarm the lock and cut shares a
+moment later. `is_splits_locked(jar_id)` reads the flag.
+
+The lock is a property of the jar, not the owner, so it **survives
+`transfer_jar_ownership`**: handing control to a new owner does not silently
+disarm the protection the collaborators agreed to. Interactions with the
+recipient-self-removal (#172) and hold/escrow (#171) paths: `leave_jar` is
+authorized by the departing recipient (who is consenting to their own removal),
+so it is compatible with a lock; held balances are keyed by recipient and are
+unaffected by locks or split edits.
 `token` is the address the tip was paid in — `get_token()` for a `tip` call,
 the caller's argument for a `tip_in_token` call. It has to be in the event: the
 other four elements carry a number and nothing else says which asset the number

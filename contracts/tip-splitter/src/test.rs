@@ -2,7 +2,10 @@
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke};
-use soroban_sdk::{symbol_short, token, vec, Address, Env, IntoVal, String, TryFromVal, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    vec, Address, Env, IntoVal, String, TryFromVal, Vec,
+};
 
 /// Shared test fixture: a fresh env with a USDC-like token and a deployed
 /// TipSplitter pointed at it. All auths are mocked.
@@ -27,6 +30,94 @@ fn setup() -> Setup {
         contract,
         token,
         admin,
+    }
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum TestTokenError {
+    NotAuthorized = 1,
+    InsufficientBalance = 2,
+}
+
+#[contracttype]
+#[derive(Clone)]
+enum TestTokenKey {
+    Balance(Address),
+    Blocked,
+}
+
+/// A minimal token used only by the #171 tests. `block` makes every `transfer`
+/// to one address revert, faithfully simulating a recipient whose account can no
+/// longer receive the asset (a dropped trustline / deauthorised account) without
+/// depending on issuer authorization flags, which the test Stellar Asset
+/// Contract registers with `flags: 0` and cannot toggle through its client.
+#[contract]
+pub struct TestToken;
+
+#[contractimpl]
+impl TestToken {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let k = TestTokenKey::Balance(to);
+        let b: i128 = env.storage().persistent().get(&k).unwrap_or(0);
+        env.storage().persistent().set(&k, &(b + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&TestTokenKey::Balance(id))
+            .unwrap_or(0)
+    }
+
+    pub fn block(env: Env, to: Address) {
+        env.storage().persistent().set(&TestTokenKey::Blocked, &to);
+    }
+
+    pub fn unblock(env: Env) {
+        env.storage().persistent().remove(&TestTokenKey::Blocked);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        if let Some(b) = env
+            .storage()
+            .persistent()
+            .get::<TestTokenKey, Address>(&TestTokenKey::Blocked)
+        {
+            if b == to {
+                panic_with_error!(&env, TestTokenError::NotAuthorized);
+            }
+        }
+        let fk = TestTokenKey::Balance(from.clone());
+        let fb: i128 = env.storage().persistent().get(&fk).unwrap_or(0);
+        if fb < amount {
+            panic_with_error!(&env, TestTokenError::InsufficientBalance);
+        }
+        env.storage().persistent().set(&fk, &(fb - amount));
+        let tk = TestTokenKey::Balance(to.clone());
+        let tb: i128 = env.storage().persistent().get(&tk).unwrap_or(0);
+        env.storage().persistent().set(&tk, &(tb + amount));
+    }
+}
+
+/// Fresh env with a TipSplitter pointed at a controllable [`TestToken`].
+struct SetupHostile {
+    env: Env,
+    contract: Address,
+    token: Address,
+}
+
+fn setup_hostile() -> SetupHostile {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token = env.register(TestToken, ());
+    let contract = env.register(TipSplitter, (admin.clone(), token.clone()));
+    SetupHostile {
+        env,
+        contract,
+        token,
     }
 }
 
@@ -159,6 +250,7 @@ fn tip_emits_tip_event_with_expected_topics_and_data() {
             jar_id.into_val(env)
         ]
     );
+    let decoded: (Address, i128, String, Vec<(Address, i128, bool)>) =
     let decoded: (Address, i128, String, Vec<(Address, i128)>, Address) =
         TryFromVal::try_from_val(env, data).expect("tip event data shape");
     let decoded: TipEventData = TryFromVal::try_from_val(env, data).expect("tip event data shape");
@@ -168,6 +260,8 @@ fn tip_emits_tip_event_with_expected_topics_and_data() {
             tipper,
             100i128,
             message,
+            vec![env, (alice.clone(), 100i128, false)]
+        )
             vec![env, (alice, 100i128)],
             s.token.clone()
         )
@@ -536,11 +630,15 @@ fn tip_breakdown(env: &Env, contract: &Address, jar_id: &String) -> std::vec::Ve
         .collect();
     assert_eq!(events.len(), 1, "expected exactly one tip event");
     let (_, _, data) = events.first().unwrap();
+    let (_, _, _, breakdown): (Address, i128, String, Vec<(Address, i128, bool)>) =
     let (_, _, _, breakdown, _): (Address, i128, String, Vec<(Address, i128)>, Address) =
     let (_, _, _, breakdown, _, _): TipEventData =
         TryFromVal::try_from_val(env, data).expect("tip event data shape");
     (0..breakdown.len())
-        .map(|i| breakdown.get(i).unwrap())
+        .map(|i| {
+            let (to, moved, _held) = breakdown.get(i).unwrap();
+            (to, moved)
+        })
         .collect()
 }
 
@@ -3360,6 +3458,50 @@ proptest! {
     }
 }
 
+// ===========================================================================
+// #171 hold undeliverable shares · #172 leave_jar · #173 lock_splits · #174 recurring
+// ===========================================================================
+
+/// Reads the raw per-recipient `tip` breakdown including the `held` flag.
+fn raw_tip_breakdown(
+    env: &Env,
+    contract: &Address,
+    jar_id: &String,
+) -> std::vec::Vec<(Address, i128, bool)> {
+    let expected_topics = vec![
+        env,
+        symbol_short!("tip").into_val(env),
+        jar_id.clone().into_val(env),
+    ];
+    let events: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == *contract && e.1 == expected_topics)
+        .collect();
+    assert_eq!(events.len(), 1, "expected exactly one tip event");
+    let (_, _, data) = events.first().unwrap();
+    let (_, _, _, breakdown): (Address, i128, String, Vec<(Address, i128, bool)>) =
+        TryFromVal::try_from_val(env, data).expect("tip event data shape");
+    (0..breakdown.len())
+        .map(|i| breakdown.get(i).unwrap())
+        .collect()
+}
+
+#[test]
+fn tip_holds_share_of_deauthorised_recipient_and_withdraw_pays_it() {
+    let s = setup_hostile();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = TestTokenClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token.mint(&tipper, &1_000);
+
+    let jar_id = String::from_str(env, "@band");
 // ---------------------------------------------------------------------------
 // #167 — per-jar running tip totals
 // ---------------------------------------------------------------------------
@@ -3383,6 +3525,58 @@ fn get_jar_stats_is_zero_before_the_first_tip() {
             env,
             Split {
                 to: alice.clone(),
+                bps: 7000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 3000,
+            },
+        ],
+    );
+
+    // Bob can no longer receive the token.
+    token.block(&bob);
+    client.tip(&tipper, &jar_id, &100, &String::from_str(env, "hi"));
+
+    // Read the tip event immediately: the test env only keeps the last
+    // invocation's events, and the balance/get_held checks below are new calls.
+    let bd = raw_tip_breakdown(env, &s.contract, &jar_id);
+    assert_eq!(bd[0], (alice.clone(), 70i128, false));
+    assert_eq!(bd[1], (bob.clone(), 30i128, true));
+
+    // Alice is paid; Bob is not, but the tip did NOT revert.
+    assert_eq!(token.balance(&alice), 70);
+    assert_eq!(token.balance(&bob), 0);
+    // Bob's share is escrowed in the contract and reported as held.
+    assert_eq!(token.balance(&s.contract), 30);
+    assert_eq!(client.get_held(&bob), 30);
+    // The tipper is debited the full amount regardless.
+    assert_eq!(token.balance(&tipper), 900);
+
+    // Bob recovers; he withdraws his held share.
+    token.unblock();
+    client.withdraw_held(&bob);
+    assert_eq!(token.balance(&bob), 30);
+    assert_eq!(token.balance(&s.contract), 0);
+    assert_eq!(client.get_held(&bob), 0);
+
+    // Nothing left to withdraw.
+    assert!(client.try_withdraw_held(&bob).is_err());
+}
+
+#[test]
+fn withdraw_held_requires_the_recipients_own_authorisation() {
+    let s = setup_hostile();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = TestTokenClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token.mint(&tipper, &1_000);
+
+    let jar_id = String::from_str(env, "@solo");
                 bps: 10000,
             },
         ],
@@ -3419,11 +3613,28 @@ fn get_jar_stats_counts_several_tips_to_one_jar() {
         &vec![
             env,
             Split {
+                to: bob.clone(),
                 to: alice.clone(),
                 bps: 10000,
             },
         ],
     );
+    token.block(&bob);
+    client.tip(&tipper, &jar_id, &100, &String::from_str(env, ""));
+    assert_eq!(client.get_held(&bob), 100);
+
+    // `withdraw_held` is gated on the recipient's own signature: with no auth
+    // granted, the call fails and the escrow is untouched.
+    env.mock_auths(&[]);
+    assert!(client.try_withdraw_held(&bob).is_err());
+    assert_eq!(client.get_held(&bob), 100);
+}
+
+#[test]
+fn leave_jar_reassigns_departing_share_to_last_entry() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
 
     client.tip(&one, &jar_id, &100, &String::from_str(env, "a"));
     assert_eq!(
@@ -3458,6 +3669,60 @@ fn get_jar_stats_does_not_leak_between_jars() {
     let owner = Address::generate(env);
     let alice = Address::generate(env);
     let bob = Address::generate(env);
+    let carol = Address::generate(env);
+
+    let jar_id = String::from_str(env, "@trio");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 4000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 3000,
+            },
+            Split {
+                to: carol.clone(),
+                bps: 3000,
+            },
+        ],
+    );
+
+    client.leave_jar(&jar_id, &bob);
+
+    // a `splits` event was published with the new count — read it before any
+    // further invocation, since the test env only exposes the last call's events
+    let expected_topics = vec![
+        env,
+        symbol_short!("splits").into_val(env),
+        jar_id.clone().into_val(env),
+    ];
+    let evs: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract && e.1 == expected_topics)
+        .collect();
+    assert_eq!(evs.len(), 1);
+    let count: u32 = TryFromVal::try_from_val(env, &evs[0].2).unwrap();
+    assert_eq!(count, 2);
+
+    let jar = client.get_jar(&jar_id);
+    assert_eq!(jar.splits.len(), 2);
+    // middle entry removed; the last remaining entry (carol) absorbs bob's 3000.
+    assert_eq!(jar.splits.get(0).unwrap().to, alice);
+    assert_eq!(jar.splits.get(0).unwrap().bps, 4000);
+    assert_eq!(jar.splits.get(1).unwrap().to, carol);
+    assert_eq!(jar.splits.get(1).unwrap().bps, 6000);
+    assert!(!client.is_recipient(&jar_id, &bob));
+}
+
+#[test]
+fn leave_jar_when_the_last_entry_leaves() {
     let tipper = Address::generate(env);
     token_admin.mint(&tipper, &10_000);
 
@@ -3510,6 +3775,10 @@ fn get_jar_stats_on_missing_jar_fails() {
     let env = &s.env;
     let client = TipSplitterClient::new(env, &s.contract);
 
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let jar_id = String::from_str(env, "@pair");
     let res = client.try_get_jar_stats(&String::from_str(env, "@ghost"));
     assert_eq!(res, Err(Ok(Error::JarNotFound.into())));
 }
@@ -3537,6 +3806,32 @@ fn reverted_tip_leaves_both_totals_unchanged() {
             env,
             Split {
                 to: alice.clone(),
+                bps: 5000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 5000,
+            },
+        ],
+    );
+
+    client.leave_jar(&jar_id, &bob); // last entry leaves
+    let jar = client.get_jar(&jar_id);
+    assert_eq!(jar.splits.len(), 1);
+    assert_eq!(jar.splits.get(0).unwrap().to, alice);
+    assert_eq!(jar.splits.get(0).unwrap().bps, 10000);
+}
+
+#[test]
+fn leave_jar_rejects_sole_and_non_recipient() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let only = Address::generate(env);
+    let stranger = Address::generate(env);
+    let jar_id = String::from_str(env, "@only");
                 bps: 10000,
             },
         ],
@@ -3590,12 +3885,31 @@ fn get_supporter_stats_is_zero_for_an_address_that_never_tipped() {
         &vec![
             env,
             Split {
+                to: only.clone(),
                 to: alice.clone(),
                 bps: 10000,
             },
         ],
     );
 
+    // sole recipient cannot leave (jar would have no splits)
+    assert!(client.try_leave_jar(&jar_id, &only).is_err());
+    // an address not in the jar cannot leave
+    assert!(client.try_leave_jar(&jar_id, &stranger).is_err());
+}
+
+#[test]
+fn lock_splits_sets_flag_and_publishes_event() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let jar_id = String::from_str(env, "@lock");
+    client.create_jar(
+        &owner,
+        &jar_id,
     assert_eq!(
         client.get_supporter_stats(&jar_id, &stranger),
         SupporterStats {
@@ -3644,6 +3958,39 @@ fn supporter_stats_are_independent_across_jars() {
             },
         ],
     );
+    assert!(!client.is_splits_locked(&jar_id));
+
+    client.lock_splits(&jar_id);
+
+    // read the `lock` event immediately: the test env only keeps the last
+    // invocation's events, and `is_splits_locked` is a separate call.
+    let expected_topics = vec![
+        env,
+        symbol_short!("lock").into_val(env),
+        jar_id.clone().into_val(env),
+    ];
+    let evs: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract && e.1 == expected_topics)
+        .collect();
+    assert_eq!(evs.len(), 1);
+    let locked: bool = TryFromVal::try_from_val(env, &evs[0].2).unwrap();
+    assert!(locked);
+
+    assert!(client.is_splits_locked(&jar_id));
+}
+
+#[test]
+fn locked_jar_needs_consent_only_from_decreased_recipients() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
     client.create_jar(
         &owner,
         &second,
@@ -3708,6 +4055,77 @@ fn supporter_stats_are_independent_across_supporters() {
             env,
             Split {
                 to: alice.clone(),
+                bps: 6000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 4000,
+            },
+        ],
+    );
+    client.lock_splits(&jar_id);
+
+    // bob 4000 -> 6000 (increase, no consent needed); alice 6000 -> 4000 (decrease, needs alice)
+    let new_splits = vec![
+        env,
+        Split {
+            to: alice.clone(),
+            bps: 4000,
+        },
+        Split {
+            to: bob.clone(),
+            bps: 6000,
+        },
+    ];
+
+    // owner signs but the decreased recipient (alice) does not -> rejected
+    env.mock_auths(&[MockAuth {
+        address: &owner,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "update_splits",
+            args: (jar_id.clone(), new_splits.clone()).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_update_splits(&jar_id, &new_splits).is_err());
+    assert_eq!(client.get_jar(&jar_id).splits.get(0).unwrap().bps, 6000);
+
+    // owner + alice (the one who lost share) -> accepted; bob never had to sign
+    env.mock_auths(&[
+        MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &s.contract,
+                fn_name: "update_splits",
+                args: (jar_id.clone(), new_splits.clone()).into_val(env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &alice,
+            invoke: &MockAuthInvoke {
+                contract: &s.contract,
+                fn_name: "update_splits",
+                args: (jar_id.clone(), new_splits.clone()).into_val(env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+    client.update_splits(&jar_id, &new_splits);
+    assert_eq!(client.get_jar(&jar_id).splits.get(1).unwrap().bps, 6000);
+}
+
+#[test]
+fn unlock_requires_all_current_recipients() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let jar_id = String::from_str(env, "@shared");
                 bps: 10000,
             },
         ],
@@ -3775,6 +4193,69 @@ fn tip_writes_the_two_totals_entries() {
             env,
             Split {
                 to: alice.clone(),
+                bps: 5000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 5000,
+            },
+        ],
+    );
+    client.lock_splits(&jar_id);
+
+    // owner alone cannot disarm the lock
+    env.mock_auths(&[MockAuth {
+        address: &owner,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "unlock_splits",
+            args: (jar_id.clone(),).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_unlock_splits(&jar_id).is_err());
+    assert!(client.is_splits_locked(&jar_id));
+
+    // owner + every current recipient can unlock
+    let args: Vec<soroban_sdk::Val> = (jar_id.clone(),).into_val(env);
+    let inv_owner = MockAuthInvoke {
+        contract: &s.contract,
+        fn_name: "unlock_splits",
+        args: args.clone(),
+        sub_invokes: &[],
+    };
+    let inv_alice = MockAuthInvoke {
+        contract: &s.contract,
+        fn_name: "unlock_splits",
+        args: args.clone(),
+        sub_invokes: &[],
+    };
+    let inv_bob = MockAuthInvoke {
+        contract: &s.contract,
+        fn_name: "unlock_splits",
+        args,
+        sub_invokes: &[],
+    };
+    env.mock_auths(&[
+        MockAuth {
+            address: &owner,
+            invoke: &inv_owner,
+        },
+        MockAuth {
+            address: &alice,
+            invoke: &inv_alice,
+        },
+        MockAuth {
+            address: &bob,
+            invoke: &inv_bob,
+        },
+    ]);
+    client.unlock_splits(&jar_id);
+    assert!(!client.is_splits_locked(&jar_id));
+}
+
+#[test]
+fn lock_survives_ownership_transfer() {
                 bps: 10000,
             },
         ],
@@ -3820,6 +4301,10 @@ fn version_matches_the_interface_constant() {
     let env = &s.env;
     let client = TipSplitterClient::new(env, &s.contract);
 
+    let owner = Address::generate(env);
+    let new_owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let jar_id = String::from_str(env, "@keeplock");
     assert_eq!(client.version(), INTERFACE_VERSION);
     assert_eq!(
         client.version(),
@@ -3887,11 +4372,28 @@ fn one_recipient_jar(
         &vec![
             env,
             Split {
+                to: alice.clone(),
                 to: recipient.clone(),
                 bps: 10000,
             },
         ],
     );
+    client.lock_splits(&jar_id);
+    client.transfer_jar_ownership(&jar_id, &new_owner);
+    assert!(client.is_splits_locked(&jar_id));
+    assert_eq!(client.get_jar_owner(&jar_id), new_owner);
+}
+
+#[test]
+fn recurring_tip_create_read_cancel_roundtrip() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let supporter = Address::generate(env);
+    let jar_id = String::from_str(env, "@creator");
     (owner, recipient, jar_id)
 }
 
@@ -4053,6 +4555,42 @@ fn tip_in_token_splits_identically_to_the_default_token() {
             env,
             Split {
                 to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    let seq = env.ledger().sequence();
+    let id = client.create_recurring(
+        &supporter,
+        &jar_id,
+        &500,
+        &100,
+        &String::from_str(env, "monthly"),
+    );
+    assert_eq!(id, 1);
+
+    let rec = client.get_recurring(&id);
+    assert_eq!(rec.supporter, supporter);
+    assert_eq!(rec.jar_id, jar_id);
+    assert_eq!(rec.amount, 500);
+    assert_eq!(rec.period_ledgers, 100);
+    assert_eq!(rec.next_due_ledger, seq + 100);
+
+    client.cancel_recurring(&id);
+    assert!(client.try_get_recurring(&id).is_err());
+}
+
+#[test]
+fn recurring_tip_validation() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let supporter = Address::generate(env);
+    let jar_id = String::from_str(env, "@v");
                 bps: 7000,
             },
             Split {
@@ -4118,6 +4656,36 @@ fn tip_in_token_rejects_a_disallowed_token_before_funds_move() {
         ],
     );
 
+    // zero period
+    assert!(client
+        .try_create_recurring(&supporter, &jar_id, &500, &0, &String::from_str(env, ""))
+        .is_err());
+    // non-positive amount
+    assert!(client
+        .try_create_recurring(&supporter, &jar_id, &0, &100, &String::from_str(env, ""))
+        .is_err());
+    // unknown jar
+    assert!(client
+        .try_create_recurring(
+            &supporter,
+            &String::from_str(env, "@nope"),
+            &500,
+            &100,
+            &String::from_str(env, "")
+        )
+        .is_err());
+}
+
+#[test]
+fn cancel_recurring_requires_the_supporter() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let supporter = Address::generate(env);
+    let jar_id = String::from_str(env, "@own");
     assert_eq!(
         client.try_tip_in_token(
             &tipper,
@@ -4237,6 +4805,14 @@ fn minimum_tip_gates_the_default_token_only() {
             },
         ],
     );
+    let id = client.create_recurring(&supporter, &jar_id, &500, &100, &String::from_str(env, ""));
+
+    // Only the supporter's signature authorizes cancellation; without it the
+    // entry survives.
+    env.mock_auths(&[]);
+    assert!(client.try_cancel_recurring(&id).is_err());
+    // still present
+    assert_eq!(client.get_recurring(&id).supporter, supporter);
     client.set_min_tip_amount(&jar_id, &Some(500_i128));
 
     // Default token: the floor holds.
