@@ -121,7 +121,8 @@ All notable changes to `novatip-contracts` are documented here.
   this unreleased cycle, so never shipped in a release — are gone: the vector
   grew without bound and made each `create_jar` cost more than the last.
   Indexers reconstruct the jar list by scanning `jar_crtd` events; see
-  [`docs/CONTRACT.md`](docs/CONTRACT.md) for the backfill procedure.
+  [`docs/CONTRACT.md`](docs/CONTRACT.md) for how discovery works and how to find
+  jars created before a build emitted `jar_crtd`.
 - `validate_splits()` now rejects any split with `bps == 0` (`InvalidSplits`).
   Such a recipient could never be paid but still consumed one of the 20
   recipient slots and appeared in clients as a collaborator. This applies to
