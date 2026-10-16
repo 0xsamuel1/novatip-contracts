@@ -5,8 +5,13 @@
 //! Novatip — `tip_splitter` contract.
 //!
 //! A "tip jar" routes a single incoming USDC tip across one or more recipients
-//! by basis-point splits. Splitting is atomic: either every recipient is paid in
-//! the same transaction or the whole tip reverts.
+//! by basis-point shares. A tipper never pays a share the jar failed to
+//! deliver: if a recipient cannot receive the token — a dropped trustline, a
+//! deauthorised account — their share is held by the contract under
+//! [`DataKey::Held`] and paid out later by `withdraw_held`, while every other
+//! recipient is still paid in the same transaction. This replaces the earlier
+//! all-or-nothing behaviour, where one collaborator's account state reverted
+//! the whole tip and punished the supporter for it.
 //!
 //! Jar discovery is intentionally event-driven: `create_jar` emits a
 //! `jar_crtd` event, and indexers reconstruct the full jar list by scanning
@@ -79,6 +84,11 @@ pub struct Split {
 pub struct Jar {
     pub owner: Address,
     pub splits: Vec<Split>,
+    /// When `true`, `update_splits` may not reduce or remove any current
+    /// recipient without that recipient's own authorisation (see #173). Set by
+    /// `lock_splits`, cleared by `unlock_splits`; survives
+    /// `transfer_jar_ownership`.
+    pub locked: bool,
 }
 
 /// The contract's hard bounds, returned by `get_limits`.
@@ -97,6 +107,33 @@ pub struct Limits {
     pub max_message_len: u32,
 }
 
+/// A supporter's standing intention to tip a jar on a schedule.
+///
+/// This is the on-chain *record* of a recurring tip, not a payment rail. A
+/// worker (or the supporter's client) reads `next_due_ledger` to decide when a
+/// payment is owed and calls `tip` then; collecting automatically would require
+/// the supporter to have approved the contract as a token spender, which is a
+/// separate concern held out of this issue on purpose so the storage model can
+/// be reviewed on its own.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Recurring {
+    /// The supporter who registered the schedule and may cancel it.
+    pub supporter: Address,
+    /// The jar every payment is routed to.
+    pub jar_id: String,
+    /// Amount of each payment, in the jar's token. Validated against the same
+    /// checks `tip` applies at registration time.
+    pub amount: i128,
+    /// Cadence, in ledgers, between payments. Must be non-zero.
+    pub period_ledgers: u32,
+    /// Message that rides along with each payment.
+    pub message: String,
+    /// First ledger at which a payment is due: the creation ledger plus
+    /// `period_ledgers`.
+    pub next_due_ledger: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     /// Contract admin (deployer); reserved for future migrations.
@@ -107,6 +144,14 @@ pub enum DataKey {
     Jar(String),
     /// Optional minimum tip amount for a jar keyed by its public slug.
     MinTip(String),
+    /// A recipient's undeliverable share, held by the contract until they can
+    /// receive it again (see #171). Keyed by the recipient address; value is
+    /// the amount owed them in the jar token.
+    Held(Address),
+    /// A recurring-tip schedule keyed by its assigned id.
+    Recurring(u128),
+    /// Monotonic counter of issued recurring-tip ids.
+    RecurringCount,
 }
 
 #[contracterror]
@@ -130,6 +175,16 @@ pub enum Error {
     SplitSumNot100Pct = 12,
     /// Tip amount is below the jar's configured minimum tip amount.
     BelowMinTipAmount = 13,
+    /// `leave_jar` was called for an address that is not in the jar's splits.
+    NotRecipient = 14,
+    /// `leave_jar` would empty the jar: the caller is its only recipient.
+    SoleRecipient = 15,
+    /// `cancel_recurring`/`get_recurring` named an id that does not exist.
+    RecurringNotFound = 16,
+    /// A recurring tip was registered with a zero payment period.
+    InvalidPeriod = 17,
+    /// `withdraw_held` was called by a recipient the contract owes nothing.
+    NothingHeld = 18,
 }
 
 #[contract]
@@ -163,6 +218,7 @@ impl TipSplitter {
             &Jar {
                 owner: owner.clone(),
                 splits,
+                locked: false,
             },
         );
 
@@ -171,6 +227,14 @@ impl TipSplitter {
     }
 
     /// Update an existing jar's splits. Only the jar owner may do this.
+    ///
+    /// On a **locked** jar (#173) the owner's signature alone is not enough:
+    /// every current recipient whose share would shrink or who would be dropped
+    /// by the new list must also authorize the call. Recipients whose share is
+    /// unchanged or increased, and brand-new recipients, are not required to
+    /// sign — the lock only protects against a collaborator being cut out or
+    /// reduced without their consent.
+    ///
     /// Emits a `splits` event so indexers caching a jar's splits know to
     /// refetch them.
     pub fn update_splits(env: Env, jar_id: String, splits: Vec<Split>) {
@@ -185,12 +249,208 @@ impl TipSplitter {
             .extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
         jar.owner.require_auth();
         Self::validate_splits(&env, &splits);
+
+        if jar.locked {
+            // Consent rule: a current recipient must sign iff their share
+            // decreases or they are removed. Compare each old entry against its
+            // new share (0 when the address is absent from the new list).
+            let old = jar.splits.clone();
+            for i in 0..old.len() {
+                let prev = old.get(i).unwrap();
+                let mut new_bps = 0u32;
+                for j in 0..splits.len() {
+                    let cand = splits.get(j).unwrap();
+                    if cand.to == prev.to {
+                        new_bps = cand.bps;
+                        break;
+                    }
+                }
+                if new_bps < prev.bps {
+                    prev.to.require_auth();
+                }
+            }
+        }
+
         let split_count = splits.len();
         env.storage().persistent().set(
             &key,
             &Jar {
                 owner: jar.owner,
                 splits,
+                locked: jar.locked,
+            },
+        );
+
+        env.events()
+            .publish((symbol_short!("splits"), jar_id), split_count);
+    }
+
+    /// Lock a jar's splits so the owner can no longer reduce or remove a
+    /// recipient without that recipient's consent (#173). Owner-only.
+    ///
+    /// A band member or co-host promoting a shared tip link gets an on-chain
+    /// assurance that their share cannot be cut behind their back. The lock is
+    /// a property of the jar, not the owner, so it survives
+    /// `transfer_jar_ownership`: handing the jar to a new owner does not
+    /// silently disarm the protection the collaborators agreed to.
+    ///
+    /// Publishing on a jar that is already locked is a no-op on state but still
+    /// emits a `lock` event, so an indexer stays in sync with the intent.
+    pub fn lock_splits(env: Env, jar_id: String) {
+        let key = DataKey::Jar(jar_id.clone());
+        let jar: Jar = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        jar.owner.require_auth();
+
+        env.storage().persistent().set(
+            &key,
+            &Jar {
+                owner: jar.owner,
+                splits: jar.splits,
+                locked: true,
+            },
+        );
+
+        env.events().publish((symbol_short!("lock"), jar_id), true);
+    }
+
+    /// Unlock a jar's splits, restoring the owner's unilateral control.
+    ///
+    /// Consent mirrors a reduction: because unlocking lets the owner then cut
+    /// any collaborator, it requires authorization from **every** current
+    /// recipient, not just the owner. Otherwise an owner could disarm the lock
+    /// first and reduce shares a moment later, which is exactly the bypass the
+    /// lock exists to prevent.
+    ///
+    /// Owner-only if there are no consent-gating recipients is not possible: a
+    /// stored jar always has at least one recipient, so the owner's own
+    /// signature alone never unlocks a locked jar that lists other collaborators.
+    pub fn unlock_splits(env: Env, jar_id: String) {
+        let key = DataKey::Jar(jar_id.clone());
+        let jar: Jar = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        jar.owner.require_auth();
+
+        // All current recipients must consent to disarm the protection.
+        let splits = jar.splits.clone();
+        for i in 0..splits.len() {
+            splits.get(i).unwrap().to.require_auth();
+        }
+
+        env.storage().persistent().set(
+            &key,
+            &Jar {
+                owner: jar.owner,
+                splits,
+                locked: false,
+            },
+        );
+
+        env.events().publish((symbol_short!("lock"), jar_id), false);
+    }
+
+    /// Whether a jar's splits are locked against unilateral owner edits (#173).
+    ///
+    /// Panics with `JarNotFound` if the slug is not registered, matching
+    /// `get_jar`.
+    pub fn is_splits_locked(env: Env, jar_id: String) -> bool {
+        let key = DataKey::Jar(jar_id);
+        let jar: Jar = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        jar.locked
+    }
+
+    /// Let a recipient remove themselves from a jar (#172), authorized by that
+    /// recipient rather than the owner.
+    ///
+    /// A collaborator listed in someone else's jar previously had no say: they
+    /// could not leave a project they had quit, stop receiving payments they
+    /// did not want attributed to them, or escape the case where their own
+    /// account can no longer receive the token. Their basis points are
+    /// reassigned by a documented rule so the remaining splits still sum to
+    /// 10 000: **the departing share is added to the last remaining entry**,
+    /// which already absorbs rounding dust elsewhere in the contract.
+    ///
+    /// Rejections:
+    /// - the caller is not in the splits — `NotRecipient`;
+    /// - the caller is the only recipient (leaving would empty the jar) —
+    ///   `SoleRecipient`.
+    ///
+    /// Ownership is untouched: the owner stays the owner. Emits the same
+    /// `splits` event as `update_splits` so indexers refresh their copy.
+    pub fn leave_jar(env: Env, jar_id: String, recipient: Address) {
+        let key = DataKey::Jar(jar_id.clone());
+        let jar: Jar = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        recipient.require_auth();
+
+        let old = jar.splits.clone();
+        let n = old.len();
+        if n == 1 {
+            panic_with_error!(&env, Error::SoleRecipient);
+        }
+        let mut found = false;
+        let mut departed_bps: u32 = 0;
+        let mut remaining: Vec<Split> = Vec::new(&env);
+        for i in 0..n {
+            let split = old.get(i).unwrap();
+            if split.to == recipient {
+                found = true;
+                departed_bps = split.bps;
+            } else {
+                remaining.push_back(split);
+            }
+        }
+        if !found {
+            panic_with_error!(&env, Error::NotRecipient);
+        }
+
+        // Documented rule: the last remaining entry absorbs the departed share.
+        let last = remaining.len() - 1;
+        let mut last_split = remaining.get(last).unwrap();
+        // `remaining` was built from validated splits (each bps within bounds
+        // and summing to 10 000); after removing one entry and adding its `bps`
+        // to the last, the total is unchanged at 10 000 and no single entry can
+        // exceed 10 000 (all others are >= 1). `checked_add` keeps any
+        // unforeseen overflow a typed error rather than a trap.
+        last_split.bps = last_split
+            .bps
+            .checked_add(departed_bps)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SplitSumNot100Pct));
+        remaining.set(last, last_split);
+
+        Self::validate_splits(&env, &remaining);
+        let split_count = remaining.len();
+        env.storage().persistent().set(
+            &key,
+            &Jar {
+                owner: jar.owner,
+                splits: remaining,
+                locked: jar.locked,
             },
         );
 
@@ -219,6 +479,9 @@ impl TipSplitter {
             &Jar {
                 owner: new_owner.clone(),
                 splits: jar.splits,
+                // The lock is a promise to the collaborators, not a privilege
+                // of the owner, so it survives the transfer (#173).
+                locked: jar.locked,
             },
         );
 
@@ -268,10 +531,15 @@ impl TipSplitter {
             .publish((symbol_short!("min_tip"), jar_id), min_amount);
     }
 
-    /// Send a tip. Transfers `amount` of USDC from `from`, split across the jar's
-    /// recipients atomically, then emits a `("tip", jar_id)` event carrying the
+    /// Send a tip. Moves `amount` of USDC out of `from` and routes it across
+    /// the jar's recipients, then emits a `("tip", jar_id)` event carrying the
     /// sender, the total, the message, and the per-recipient breakdown in split
     /// order.
+    ///
+    /// A recipient who cannot receive the token no longer reverts the whole tip:
+    /// their share is escrowed in the contract (credit under `DataKey::Held`)
+    /// and marked `held` in the breakdown, while everyone else is paid normally.
+    /// `withdraw_held` releases it once the recipient can receive again (#171).
     ///
     /// `message` may be at most `MAX_MESSAGE_LEN` bytes; it is rejected before
     /// any funds move.
@@ -314,6 +582,7 @@ impl TipSplitter {
             .get(&DataKey::Token)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let client = token::Client::new(&env, &token_addr);
+        let contract_addr = env.current_contract_address();
 
         let n = jar.splits.len();
         // One shared calculation with `preview_split`, so the number a client
@@ -322,11 +591,15 @@ impl TipSplitter {
 
         let mut skipped: i128 = 0;
         // The per-recipient breakdown published in the `tip` event, in split
-        // order. Recording it as the transfers happen is what makes the event
-        // self-describing: an indexer that recomputed the split arithmetic
-        // from `get_jar` could get a different answer, because the jar's
-        // splits may have changed between the tip and the read.
-        let mut breakdown: Vec<(Address, i128)> = Vec::new(&env);
+        // order. Each entry is `(recipient, moved, held)`: `moved` is what left
+        // the tipper for that recipient this call (0 for a self-transfer that
+        // was rolled into the last recipient), and `held` marks a share the
+        // recipient could not receive and the contract is now escrowing (#171).
+        // Recording it as the transfers happen is what makes the event
+        // self-describing: an indexer that recomputed the split arithmetic from
+        // `get_jar` could get a different answer, because the jar's splits may
+        // have changed between the tip and the read.
+        let mut breakdown: Vec<(Address, i128, bool)> = Vec::new(&env);
         for i in 0..n {
             let split = jar.splits.get(i).unwrap();
             let mut share = shares.get(i).unwrap();
@@ -337,27 +610,207 @@ impl TipSplitter {
                 // accumulated only the amounts it actually transferred.
                 share += skipped;
             }
-            let paid = if share > 0 && split.to != from {
+            if share > 0 && split.to != from {
                 // Skip self-transfers: a tipper who is also a recipient would
                 // otherwise pay themselves with a no-op transfer that burns gas
                 // and emits a confusing token event.
-                client.transfer(&from, &split.to, &share);
-                share
+                let delivered = matches!(client.try_transfer(&from, &split.to, &share), Ok(Ok(_)));
+                if delivered {
+                    breakdown.push_back((split.to, share, false));
+                } else {
+                    // The recipient cannot receive the token (dropped trustline,
+                    // deauthorised account). Hold their share in the contract
+                    // so one collaborator's account state no longer reverts the
+                    // whole tip: the funds leave the tipper exactly as if the
+                    // transfer had succeeded, and `withdraw_held` pays them once
+                    // the recipient can receive again (#171).
+                    client.transfer(&from, &contract_addr, &share);
+                    let held_key = DataKey::Held(split.to.clone());
+                    let held: i128 = env.storage().persistent().get(&held_key).unwrap_or(0);
+                    env.storage().persistent().set(&held_key, &(held + share));
+                    env.storage().persistent().extend_ttl(
+                        &held_key,
+                        JAR_TTL_THRESHOLD,
+                        JAR_TTL_LEDGERS,
+                    );
+                    breakdown.push_back((split.to, share, true));
+                }
             } else {
                 skipped += share;
                 // Nothing moved, so the breakdown reports 0 rather than the
                 // notional share. The event is a record of the transfers this
                 // call actually made, which is what a balance-tracking indexer
                 // needs to stay in step with the ledger.
-                0
-            };
-            breakdown.push_back((split.to, paid));
+                breakdown.push_back((split.to, 0, false));
+            }
         }
 
         env.events().publish(
             (symbol_short!("tip"), jar_id),
             (from, amount, message, breakdown),
         );
+    }
+
+    /// Read how much the contract is holding for `recipient` because a past tip
+    /// could not deliver their share (#171). Returns 0 when nothing is held.
+    pub fn get_held(env: Env, recipient: Address) -> i128 {
+        let held_key = DataKey::Held(recipient);
+        let held: i128 = env.storage().persistent().get(&held_key).unwrap_or(0);
+        if held > 0 {
+            env.storage()
+                .persistent()
+                .extend_ttl(&held_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        }
+        held
+    }
+
+    /// Pay out a recipient's held balance to them, once their account can
+    /// receive the token again. Only `recipient` may authorize this (#171).
+    ///
+    /// Rejected with `NothingHeld` when the contract holds nothing for them, so
+    /// a caller cannot mistake a no-op for a successful withdrawal.
+    pub fn withdraw_held(env: Env, recipient: Address) {
+        recipient.require_auth();
+        let held_key = DataKey::Held(recipient.clone());
+        let held: i128 = env.storage().persistent().get(&held_key).unwrap_or(0);
+        if held <= 0 {
+            panic_with_error!(&env, Error::NothingHeld);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let client = token::Client::new(&env, &token_addr);
+        let contract_addr = env.current_contract_address();
+
+        // Clear the balance before the transfer so the withdrawal cannot be
+        // re-entered against a stale credit; the escrow invariant is that a
+        // recipient's held total only ever decreases to zero on withdrawal.
+        env.storage().persistent().remove(&held_key);
+        client.transfer(&contract_addr, &recipient, &held);
+
+        env.events()
+            .publish((symbol_short!("withdraw"), recipient), held);
+    }
+
+    /// Register a recurring tip to a jar (#174), authorized by the supporter.
+    ///
+    /// This stores the on-chain *record* only — it moves no funds. A payment is
+    /// still a normal `tip`, triggered when the schedule comes due; automatic
+    /// collection depends on the supporter having separately approved the
+    /// contract as a token spender, which is deliberately a different concern so
+    /// this storage model can be reviewed on its own.
+    ///
+    /// Validated against the same checks `tip` applies so a stored schedule can
+    /// actually be paid: the jar must exist, `amount` must be positive and pass
+    /// `compute_shares` (no zero-truncated shares, no `i128` overflow) and clear
+    /// any per-jar minimum tip, the message must fit `MAX_MESSAGE_LEN`, and
+    /// `period_ledgers` must be non-zero. The new entry records its first due
+    /// ledger (`current + period_ledgers`) and is stored under a fresh id.
+    ///
+    /// Emits a `recr_add` event carrying the assigned id.
+    pub fn create_recurring(
+        env: Env,
+        supporter: Address,
+        jar_id: String,
+        amount: i128,
+        period_ledgers: u32,
+        message: String,
+    ) -> u128 {
+        supporter.require_auth();
+        if period_ledgers == 0 {
+            panic_with_error!(&env, Error::InvalidPeriod);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+        if message.len() > MAX_MESSAGE_LEN {
+            panic_with_error!(&env, Error::MessageTooLong);
+        }
+
+        let jar_key = DataKey::Jar(jar_id.clone());
+        let jar: Jar = env
+            .storage()
+            .persistent()
+            .get(&jar_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+
+        // Same minimum-tip gate `tip` applies.
+        let min_key = DataKey::MinTip(jar_id.clone());
+        if let Some(min_amount) = env.storage().persistent().get::<DataKey, i128>(&min_key) {
+            if amount < min_amount {
+                panic_with_error!(&env, Error::BelowMinTipAmount);
+            }
+        }
+
+        // Runs the tip's split arithmetic so a schedule whose amount could never
+        // be paid (dust-truncation or overflow) is rejected at registration.
+        let _ = Self::compute_shares(&env, &jar.splits, amount);
+
+        let count_key = DataKey::RecurringCount;
+        let count: u128 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let id = count + 1;
+        env.storage().persistent().set(&count_key, &id);
+
+        let next_due_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(period_ledgers)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidPeriod));
+
+        let entry = Recurring {
+            supporter: supporter.clone(),
+            jar_id,
+            amount,
+            period_ledgers,
+            message,
+            next_due_ledger,
+        };
+        let rec_key = DataKey::Recurring(id);
+        env.storage().persistent().set(&rec_key, &entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rec_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+
+        env.events()
+            .publish((symbol_short!("recr_add"), supporter), id);
+        id
+    }
+
+    /// Cancel a recurring tip (#174). Only the supporter who created it may
+    /// authorize. Removes the stored entry and emits a `recr_del` event.
+    pub fn cancel_recurring(env: Env, id: u128) {
+        let rec_key = DataKey::Recurring(id);
+        let entry: Recurring = env
+            .storage()
+            .persistent()
+            .get(&rec_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::RecurringNotFound));
+        entry.supporter.require_auth();
+
+        env.storage().persistent().remove(&rec_key);
+        env.events()
+            .publish((symbol_short!("recr_del"), entry.supporter), id);
+    }
+
+    /// Read a stored recurring-tip entry, including its `next_due_ledger`
+    /// (#174). Panics with `RecurringNotFound` for an unknown id.
+    pub fn get_recurring(env: Env, id: u128) -> Recurring {
+        let rec_key = DataKey::Recurring(id);
+        let entry: Recurring = env
+            .storage()
+            .persistent()
+            .get(&rec_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::RecurringNotFound));
+        env.storage()
+            .persistent()
+            .extend_ttl(&rec_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        entry
     }
 
     /// Read a jar's configuration.
