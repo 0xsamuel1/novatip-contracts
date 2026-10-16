@@ -27,20 +27,30 @@ basis-point shares, atomically, in one transaction.
 ## Types
 
 ```rust
-struct Split  { to: Address, bps: u32 }
-struct Jar    { owner: Address, splits: Vec<Split> }
-struct Limits { bps_denom: u32, max_recipients: u32, max_message_len: u32 }
+struct Split          { to: Address, bps: u32 }
+struct Jar            { owner: Address, splits: Vec<Split> }
+struct Limits         { bps_denom: u32, max_recipients: u32, max_message_len: u32 }
+struct JarStats       { tip_count: u64, total: i128 }
+struct SupporterStats { tip_count: u64, total: i128 }
 ```
+
+`JarStats` and `SupporterStats` are the on-chain totals behind
+[reading tip totals](#reading-tip-totals). They share a shape but not a key:
+one belongs to a jar, the other to a `(jar, supporter)` pair.
 
 ## Functions
 
 | Function | Auth | Description |
 |----------|------|-------------|
-| `__constructor(admin, token)` | — | Deploy-time init. Stores the admin and USDC token address. |
+| `__constructor(admin, token)` | — | Deploy-time init. Stores the admin and USDC token address, and puts that token on the tip allowlist as its first entry. |
 | `create_jar(owner, jar_id, splits)` | `owner` | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. |
 | `update_splits(jar_id, splits)` | jar `owner` | Replace a jar's splits. Subject to the same validation as `create_jar`. Emits a `splits` event. |
 | `set_min_tip_amount(jar_id, min_amount)` | jar `owner` | Set or clear an optional minimum tip amount for a jar. `min_amount` must be strictly positive (`> 0`) or `None` to clear. Emits a `min_tip` event. |
 | `transfer_jar_ownership(jar_id, new_owner)` | current jar `owner` | Hand control of a jar to `new_owner`. Splits are unchanged; the new owner does not need to authorize. Emits a `jar_xfer` event carrying both owners. |
+| `tip(from, jar_id, amount, message)` | `from` | Transfer `amount` of the **default token** from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown and the token paid in. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
+| `tip_in_token(from, jar_id, token, amount, message)` | `from` | Same split, paid in `token`, which must be on the allowlist — otherwise `TokenNotAllowed`, raised before any transfer. The jar minimum applies only when `token` is the default token. Emits the same `tip` event. |
+| `allow_token(token)` | contract `admin` | Add `token` to the allowlist. Idempotent. Emits a `tk_allow` event carrying the admin who authorised it. |
+| `disallow_token(token)` | contract `admin` | Remove `token` from the allowlist. Refuses the default token with `CannotDisallowDefault`. Emits a `tk_dis` event carrying the admin. |
 | `tip(from, jar_id, amount, message) -> u64` | `from` | Transfer `amount` USDC from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown and this tip's sequence number, and returns that number. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
 | `tip_with_ref(from, jar_id, amount, message, reference) -> u64` | `from` | Identical to `tip`, plus an optional 32-byte opaque `reference` echoed in the `tip` event. Same transfers, same validation, same counter — both entry points call one internal implementation. |
 | `get_tip_count() -> u64` | — | How many tips the contract has taken, i.e. the number the next tip will receive. `0` on a fresh deploy. |
@@ -54,6 +64,10 @@ struct Limits { bps_denom: u32, max_recipients: u32, max_message_len: u32 }
 | `get_token() -> Address` | — | The USDC token address tips settle in. |
 | `get_admin() -> Address` | — | The contract admin recorded at deploy time. |
 | `get_limits() -> Limits` | — | The bounds this contract enforces: `bps_denom`, `max_recipients`, `max_message_len`. Reads no storage. |
+| `version() -> u32` | — | Which interface shape this deployment speaks. Reads no storage. See [detecting the interface version](#detecting-the-interface-version). |
+| `get_jar_stats(jar_id) -> JarStats` | — | A jar's on-chain tip count and total. Zeros for a jar nobody has tipped; `JarNotFound` if the slug is free. |
+| `get_supporter_stats(jar_id, supporter) -> SupporterStats` | — | One address's tip count and total against one jar. Zeros for an address that has never tipped it; `JarNotFound` if the slug is free. |
+| `is_token_allowed(token) -> bool` | — | Whether the admin has put `token` on the tip allowlist. The default token is always allowed. |
 The **Errors** column lists the `tip_splitter` error codes a call can return,
 **in the order the contract checks them** — only the first failure a call hits
 is reported, so the order tells a client what it will actually see. An error is
@@ -406,6 +420,10 @@ slug names at submission time.
 | 10 | `SplitsEmpty` | The splits list is empty. |
 | 11 | `SplitOutOfRange` | An entry has `bps == 0` or `bps > 10_000`. Checked per entry, before the sum. |
 | 12 | `SplitSumNot100Pct` | The shares sum to something other than exactly 10 000 bps, including a sum that would overflow `u32`. |
+| 13 | `BelowMinTipAmount` | Tip amount is strictly below the jar's configured minimum tip amount. Raised by `tip`, by `preview_split`, and by `tip_in_token` when it is paid in the default token. |
+| 14 | `TokenNotAllowed` | `tip_in_token` was given a token the admin has not allowed. Raised before any transfer, so a rejected tip moves nothing. |
+| 15 | `CannotDisallowDefault` | `disallow_token` was given the deploy-time token, which `tip` always pays through and which therefore stays non-removable. |
+| 16 | `StatsOverflow` | A running tip total would not fit `u64`/`i128`. Effectively unreachable; the counters use checked arithmetic so an exhaustion reports as this code rather than a wasm trap. |
 | 13 | `BelowMinTipAmount` | Tip amount is strictly below the jar's configured minimum tip amount. Raised by `tip` and `preview_split`. |
 | 14 | `InsufficientBalance` | Tip amount exceeds the sender's USDC balance. Checked once per `tip`, before any transfer. |
 
@@ -507,6 +525,7 @@ Lets indexers track the current minimum tip floor for a jar without polling `get
 ### `tip` — published on every successful tip
 
 - **Topics:** `(symbol "tip", jar_id: String)`
+- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128)>, token: Address)`
 - **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128)>, seq: u64, reference: Option<BytesN<32>>)`
 
 The backend indexer subscribes to this event to update balances, leaderboards,
@@ -545,6 +564,185 @@ Note that `breakdown` is a snapshot, not the jar's current state. To ask
 whether an address is a recipient *now*, use
 [`is_recipient`](#confirming-you-are-a-recipient).
 
+`token` is the address the tip was paid in — `get_token()` for a `tip` call,
+the caller's argument for a `tip_in_token` call. It has to be in the event: the
+other four elements carry a number and nothing else says which asset the number
+counts, so an indexer could not tell a tip of 10 USDC from a tip of 10 XLM, and
+a jar tipped in two assets would have its per-supporter balances summed across
+them as if they were one currency. Reading it from the transaction instead is
+not enough, because the contract calls the token itself and the event consumer
+sees only the tip's own envelope.
+
+> **Consumer impact.** The data tuple grew from three elements to four, and
+> now from four to five. A decoder that reads it positionally —
+> `decodeTipEvent` in `@novatip/sdk`, and the backend indexer — must be updated
+> to accept the fifth element before it reads events from a contract built
+> from this version. The first four are unchanged and keep their positions, so
+> a consumer that ignores trailing elements is unaffected; a consumer that
+> validates the element count rejects them all, which is why this shape change
+> also bumps [`version()`](#detecting-the-interface-version).
+
+## Reading tip totals
+
+Two views report what has actually settled on-chain:
+
+```rust
+get_jar_stats(jar_id)                -> JarStats       { tip_count, total }
+get_supporter_stats(jar_id, supporter) -> SupporterStats { tip_count, total }
+```
+
+Both are bumped at the end of a tip that paid out, and neither is written by a
+tip that reverted — a transfer that traps aborts the whole call, counters
+included. That is what makes them usable as a check rather than a second
+opinion:
+
+- `get_jar_stats` is the figure a creator compares against the backend's. The
+  indexer has blind spots it cannot report: `planBatch` gives up on any ledger
+  that returns a full page of events, and an event older than the RPC's
+  retention window can never be backfilled. A missed tip silently lowers a
+  creator's total, and until now nothing on-chain contradicted it. A third-party
+  page or embeddable button also gets a total with no dependence on Novatip's
+  backend.
+- `get_supporter_stats` is the data the roadmap's `supporter_badge` contract
+  needs. Milestones are phrased as "10 tips or $10 cumulative", and a contract
+  cannot read a Postgres row; before this, a badge could only be minted by a
+  trusted off-chain service asserting the milestone.
+
+A jar that exists but has never been tipped reads `tip_count: 0, total: 0`, as
+does a supporter who has not tipped a given jar. A **free slug** is
+`JarNotFound`, not zeros — a typo'd handle must not look like a jar nobody has
+tipped.
+
+**Storage.** `DataKey::Stats(jar_id)` and `DataKey::Supporter(jar_id,
+supporter)` are persistent entries under the same TTL policy as the jar itself
+(`JAR_TTL_LEDGERS`, bumped at the same threshold), and both views bump on read.
+The supporter entry describes one supporter's relationship with one jar, so an
+archived entry means they restore it or tip again — the history is still in the
+event log, and a badge check that reads zeros asks for a restore rather than
+minting on a wrong count.
+
+### What it costs per tip
+
+The totals are two extra persistent writes on a path that already writes.
+Measured with `env.cost_estimate()` in `test::tip_writes_the_two_totals_entries`
+(one recipient, one supporter tipping a fresh jar twice), against the same tip
+with the counters disabled:
+
+| | without totals | with totals | difference |
+|---|---|---|---|
+| Ledger writes | 3 | 5 | **+2 entries** |
+| Bytes written | 520 | 924 | **+404 bytes** |
+| Persistent rent bumps | 2 | 4 | **+2** |
+| Modelled CPU instructions | ~214k | ~268k | **~+25%** |
+
+The difference is flat, not cumulative: a second tip by the same supporter to
+the same jar rewrites the same two entries and adds no new ones (the test
+asserts this). What the extra rent buys is the ability to disagree with the
+indexer — a tip the counters show and the database does not is a bug report,
+where previously the two were indistinguishable.
+
+## Tipping in another token
+
+`tip` settles in the deploy-time token, fixed at construction. A supporter
+holding EURC had to swap before tipping anything. The admin now manages an
+allowlist and there is a second entry point:
+
+```rust
+allow_token(token)                     // admin only, idempotent
+disallow_token(token)                  // admin only, refuses the default token
+is_token_allowed(token) -> bool
+tip_in_token(from, jar_id, token, amount, message)
+```
+
+`tip_in_token` checks the allowlist before it loads the jar or moves funds, so
+an unlisted token fails with `TokenNotAllowed` and pays nobody. Everything else
+about it is identical to `tip`: the same `compute_shares`, the same
+self-transfer skip, the same breakdown, the same counters, the same event —
+which is why the event names the token.
+
+`tip` itself is unchanged and always pays through `get_token()`, which is
+allowlisted by the constructor. That keeps every existing integration working,
+and means `get_token()` and `is_token_allowed(get_token())` can never disagree.
+
+**Why the default token cannot be disallowed.** `tip` ignores the allowlist by
+design — it is the entry point the whole product is built on. Removing its
+token would leave a working tip path for an asset the view calls closed, and
+`get_token()` would return something `is_token_allowed` rejects. So
+`disallow_token` refuses it with `CannotDisallowDefault`; an operator who wants
+to retire the default asset deploys a new contract.
+
+**Why the list lives in instance storage.** An allowlist entry is contract
+configuration, in the same category as `Admin` and `Token`. A persistent entry
+that nobody touches is archived silently, and the failure would look like
+"EURC stopped working" with no admin action behind it — the one behaviour an
+allowlist must not have. Instance storage is extended with the contract
+instance, so an entry cannot expire ahead of the contract that reads it.
+
+### The minimum tip, and the decision recorded here
+
+`set_min_tip_amount` stores a raw `i128` with no unit. Issue #170 asked for a
+decision, and there were two defensible ones — apply the floor to the default
+token only, or make it per-token:
+
+**Chosen: the minimum applies to the default token only.** A tip in another
+allowed asset is not gated by it, even if that asset is the one the minimum was
+set in mind for. Making it per-token would mean changing `set_min_tip_amount`'s
+signature and its storage key, which breaks every jar that already configured a
+minimum — a migration for a feature nobody has asked to price per-asset. The
+number is also genuinely unpriceable across assets: 500 is a different amount of
+money in a 6-decimal token than in a 7-decimal one, so a per-token floor needs a
+unit per entry, not a rename.
+
+The consequence is real and deliberate: **a jar can be tipped below its floor in
+another allowed asset.** A creator who cares about a floor should keep the
+allowlist to the token they set the minimum in. `preview_split` keeps enforcing
+the minimum as it always did, so it describes a default-token tip.
+
+`compute_shares` needed no equivalent decision. It splits by basis points and
+never interprets magnitude, so the same arithmetic is correct for any asset —
+which is exactly what makes an EURC tip of 100 pay 70/30 just as a USDC tip of
+100 does.
+
+## Detecting the interface version
+
+```rust
+version() -> u32   // reads no storage
+```
+
+The shape of `tip`'s event has changed twice and `jar_xfer`'s data once, always
+under the same function names, and `decodeTipEvent` in the SDK kept reading
+three elements after the contract published four. A client given only a
+contract id had no way to find out which build it was talking to before
+decoding, so a mismatch surfaced as a parse failure — or as silently ignored
+new data.
+
+`version()` lets it ask first. It returns a compile-time constant, so it costs
+no storage read and works against a contract with no jars and no callers.
+
+**When the number moves.** Bump `INTERFACE_VERSION` by one when a function is
+added or removed, an error code is added or renumbered, or an event's shape
+changes. Do not bump it for an internal refactor, a new storage key, or a doc
+edit — none of those are visible to a consumer, and a version that changes when
+nothing observable did is a version consumers stop trusting.
+
+This PR ships `version() == 1`, which describes the interface as of this build:
+`tip` events with five elements, totals views, and the token allowlist.
+
+**How a client should use it.** Treat an unrecognised number as "newer than I
+was built for", not as an error. Every field a lower version documented still
+exists at a higher one — changes are appended — so the safe response is to read
+what you know and ignore the rest. Refusing to connect on a version you have
+not seen would turn a future additive release into an outage.
+
+`version()` is per-contract feature detection. It complements the per-event
+schema version proposed in #83 rather than replacing it: that answers "what
+shape is this record", this answers "what build is this deployment".
+
+## Jar discovery — design decision
+
+The previous contract exposed a `get_jar_ids() -> Vec<String>` view backed by
+an instance-storage vector that grew by one entry on every `create_jar` call.
+This had two problems:
 #### `seq` — the tip's sequence number
 
 `seq` is a contract-wide counter, incremented once per successful tip, and is
