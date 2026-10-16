@@ -1,4 +1,4 @@
-.PHONY: build optimize test fmt lint clean deploy
+.PHONY: build optimize test fmt lint clean deploy check-docs
 
 # Build all contracts to wasm (requires the Stellar CLI).
 build:
@@ -38,3 +38,8 @@ clean:
 # Deploy to the configured network (see scripts/deploy.sh).
 deploy:
 	./scripts/deploy.sh
+
+# Build the contract and fail if docs/CONTRACT.md's function or error tables
+# no longer match the built interface (requires the Stellar CLI and jq).
+check-docs:
+	./scripts/check-docs.sh

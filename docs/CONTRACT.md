@@ -101,10 +101,16 @@ and cache it for the session.
 [Message](#concepts) above. A client showing a remaining-characters indicator
 must count UTF-8 bytes against this number, not `message.length`.
 
-A test asserts the returned values equal the constants, so the view and the
-enforcement cannot drift apart. The current values are also asserted
-literally, which means changing a bound fails the suite until this document is
-updated with it.
+A test asserts the returned values equal the constants (`get_limits_matches_
+contract_constants` in `test.rs`), so the view and the enforcement cannot drift
+apart. The current values are also asserted literally, which means changing a
+bound fails the suite until the constants are updated with it. The document
+you are reading is checked too: `scripts/check-docs.sh` (`make check-docs`,
+and a CI step) builds the contract, reads its public interface out of the
+built wasm, and fails when the Functions table above or the Errors table
+below no longer matches the contract — a function or error variant missing
+from either table, listed there although the contract does not have it, or
+documented with a different error number.
 
 ### Reading just the owner
 
@@ -221,12 +227,12 @@ and could produce jars no frontend can address. The bound is inclusive: a
 
 `create_jar` and `update_splits` share one validator, so both enforce all of:
 
-- The list must be non-empty — `InvalidSplits`.
+- The list must be non-empty — `SplitsEmpty`.
 - At most 20 entries (`MAX_RECIPIENTS`) — `TooManyRecipients`.
-- **No entry may have `bps == 0`** — `InvalidSplits`.
+- **No entry may have `bps == 0`** — `SplitOutOfRange`.
 - **No address may appear twice** — `DuplicateRecipient`.
-- **No entry may have `bps > 10_000`** — `InvalidSplits`.
-- The `bps` values must sum to exactly `10_000` — `InvalidSplits`.
+- **No entry may have `bps > 10_000`** — `SplitOutOfRange`.
+- The `bps` values must sum to exactly `10_000` — `SplitSumNot100Pct`.
 
 A `bps == 0` entry is rejected rather than accepted-and-ignored. Such a
 recipient could never be paid (`tip` skips zero shares), but it would still
@@ -253,7 +259,7 @@ to a set summing to 100% — the sum check would reject it anyway. It is rejecte
 per entry because that also bounds the running total: with at most 20 entries
 of at most `10_000` each, the accumulator can never exceed `200_000`, far below
 `u32::MAX`. The sum is additionally accumulated with `checked_add`, which fails
-with `InvalidSplits` rather than trapping.
+with `SplitSumNot100Pct` rather than trapping.
 
 This matters because `bps` is caller-supplied and unbounded in the wire type.
 Before, a set of shares whose true sum exceeded `u32::MAX` relied on
@@ -433,10 +439,28 @@ not acceptable.
 
 ## Deploy & bootstrap
 
+The scripts load `.env` from the repository root themselves — exported
+variables win over `.env`, and no manual `source` step is needed. They work
+when started from any directory.
+
 ```bash
-set -a; source .env; set +a
 ./scripts/deploy.sh        # deploys, writes .contract-id
 ./scripts/create-jar.sh    # registers an example jar
 ```
+
+Once a jar exists:
+
+```bash
+./scripts/jar-info.sh                      # read-only: owner, recipients, minimum tip
+AMOUNT=100000 ./scripts/jar-info.sh        # ... plus what a tip of that size pays each recipient
+./scripts/update-splits.sh                 # replace a jar's splits (signed by the jar owner)
+SPLITS='[{"to":"G...A","bps":7000},{"to":"G...B","bps":3000}]' ./scripts/update-splits.sh
+```
+
+`jar-info.sh` only simulates — it submits no transactions and pays no fee, and
+any `SOURCE` identity works. `update-splits.sh` validates the new splits with
+the same checks as `create-jar.sh` (both share `scripts/lib/splits.sh`), prints
+the old and new splits side by side, refuses to send when they are unchanged,
+and requires `SOURCE` to be the jar's owner before invoking `update_splits`.
 
 See [`.env.example`](../.env.example) for required variables.
