@@ -1,4 +1,4 @@
-.PHONY: build optimize test fmt lint clean deploy
+.PHONY: build optimize test fmt lint clean deploy ci
 
 # Build all contracts to wasm (requires the Stellar CLI).
 build:
@@ -38,3 +38,12 @@ clean:
 # Deploy to the configured network (see scripts/deploy.sh).
 deploy:
 	./scripts/deploy.sh
+
+# Run everything CI checks, in the same order with the same flags,
+# including the wasm build and size check.
+ci:
+	cargo fmt --all -- --check
+	cargo clippy --all-targets -- -D warnings
+	cargo test
+	cargo build --target wasm32-unknown-unknown --release
+	./scripts/check-wasm-size.sh

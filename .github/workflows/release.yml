@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned Stellar CLI used for release builds. Must match the major version
+  # of soroban-sdk (workspace Cargo.toml) and is documented in RELEASING.md.
+  # The build itself runs `stellar contract build` + `stellar contract
+  # optimize`, exactly as scripts/deploy.sh does.
+  STELLAR_CLI_VERSION: "22.0.0"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show
+
+      - name: Add wasm targets
+        run: rustup target add wasm32v1-none wasm32-unknown-unknown
+
+      - name: Install pinned Stellar CLI
+        run: cargo install stellar-cli --version "$STELLAR_CLI_VERSION" --locked --force
+
+      - name: Check tag matches crate version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(grep '^version =' contracts/tip-splitter/Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "tag: $TAG, crate: $VERSION"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag v$TAG does not match crate version $VERSION" >&2
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$TAG" >> "$GITHUB_ENV"
+
+      - name: Build contract
+        run: stellar contract build
+
+      - name: Optimize wasm
+        run: |
+          WASM="$(find target -name 'tip_splitter.wasm' -path '*release*' -not -path '*/deps/*' \
+                  -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+          if [ -z "${WASM}" ] || [ ! -f "${WASM}" ]; then
+            echo "error: no built tip_splitter.wasm found under target/." >&2
+            exit 1
+          fi
+          stellar contract optimize --wasm "${WASM}"
+          OPTIMIZED="${WASM%.wasm}.optimized.wasm"
+          cp "${OPTIMIZED}" tip_splitter.optimized.wasm
+          sha256sum tip_splitter.optimized.wasm | awk '{print $1}' > tip_splitter.optimized.wasm.sha256
+          echo "SHA-256: $(cat tip_splitter.optimized.wasm.sha256)"
+          echo "OPTIMIZED_WASM=tip_splitter.optimized.wasm" >> "$GITHUB_ENV"
+
+      - name: Extract interface spec
+        run: stellar contract inspect interface --wasm tip_splitter.optimized.wasm > interface.json
+
+      - name: Extract changelog section
+        run: |
+          awk -v v="$RELEASE_VERSION" '
+            $0 ~ "^## \\[" v "\\]" {flag=1; next}
+            flag && /^## \[/ {exit}
+            flag {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "::error::no CHANGELOG.md section found for $RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: tip_splitter.optimized.wasm
+
+      # No deploy step here: deployment keys stay with the maintainers.
+      # A deploy starts from this published artifact (see RELEASING.md).
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$RELEASE_VERSION" \
+            --title "v$RELEASE_VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            tip_splitter.optimized.wasm \
+            tip_splitter.optimized.wasm.sha256 \
+            interface.json

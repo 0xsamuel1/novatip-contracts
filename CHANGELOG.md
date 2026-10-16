@@ -30,6 +30,12 @@ All notable changes to `novatip-contracts` are documented here.
   checks
 - `docs/CONTRACT.md` gains "Calling from another contract", "USDC
   trustlines" and "Inspecting events" sections
+- `InsufficientBalance` (code 14, appended so existing codes are unchanged).
+  `tip` reads the sender's token balance once before the first transfer and
+  fails with this code when `balance < amount`, instead of letting the SAC's
+  overlapping `BalanceError` (code 10) propagate as `SplitsEmpty`. Other token
+  failures (missing or frozen trustline, allowance overflow) still surface
+  with the token's own number — see `docs/CONTRACT.md`
 - `get_limits() -> Limits` returns `bps_denom`, `max_recipients` and
   `max_message_len`, so clients read the bounds from the contract they are
   talking to instead of hardcoding their own copy
@@ -140,7 +146,8 @@ All notable changes to `novatip-contracts` are documented here.
   this unreleased cycle, so never shipped in a release — are gone: the vector
   grew without bound and made each `create_jar` cost more than the last.
   Indexers reconstruct the jar list by scanning `jar_crtd` events; see
-  [`docs/CONTRACT.md`](docs/CONTRACT.md) for the backfill procedure.
+  [`docs/CONTRACT.md`](docs/CONTRACT.md) for how discovery works and how to find
+  jars created before a build emitted `jar_crtd`.
 - `validate_splits()` now rejects any split with `bps == 0` (`InvalidSplits`).
   Such a recipient could never be paid but still consumed one of the 20
   recipient slots and appeared in clients as a collaborator. This applies to
