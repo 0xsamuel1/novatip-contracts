@@ -16,6 +16,13 @@ basis-point shares, atomically, in one transaction.
   tip settles in that asset.
 - **Message** — the free-text note a supporter attaches to a tip. Capped at
   `280` bytes (`MAX_MESSAGE_LEN`) and echoed into the `tip` event.
+- **Sequence number** — a contract-wide `u64`, incremented once per successful
+  tip, returned by `tip` and published in the `tip` event. Gives each tip an
+  identifier of its own where the transaction hash does not.
+- **Reference** — an optional 32-byte opaque id a tipper attaches with
+  `tip_with_ref`, echoed in the `tip` event so the calling integration can
+  match the on-chain event back to whatever it created off-chain. Never stored
+  and never checked by the contract.
 
 ## Types
 
@@ -27,6 +34,26 @@ struct Limits { bps_denom: u32, max_recipients: u32, max_message_len: u32 }
 
 ## Functions
 
+| Function | Auth | Description |
+|----------|------|-------------|
+| `__constructor(admin, token)` | — | Deploy-time init. Stores the admin and USDC token address. |
+| `create_jar(owner, jar_id, splits)` | `owner` | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. |
+| `update_splits(jar_id, splits)` | jar `owner` | Replace a jar's splits. Subject to the same validation as `create_jar`. Emits a `splits` event. |
+| `set_min_tip_amount(jar_id, min_amount)` | jar `owner` | Set or clear an optional minimum tip amount for a jar. `min_amount` must be strictly positive (`> 0`) or `None` to clear. Emits a `min_tip` event. |
+| `transfer_jar_ownership(jar_id, new_owner)` | current jar `owner` | Hand control of a jar to `new_owner`. Splits are unchanged; the new owner does not need to authorize. Emits a `jar_xfer` event carrying both owners. |
+| `tip(from, jar_id, amount, message) -> u64` | `from` | Transfer `amount` USDC from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown and this tip's sequence number, and returns that number. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
+| `tip_with_ref(from, jar_id, amount, message, reference) -> u64` | `from` | Identical to `tip`, plus an optional 32-byte opaque `reference` echoed in the `tip` event. Same transfers, same validation, same counter — both entry points call one internal implementation. |
+| `get_tip_count() -> u64` | — | How many tips the contract has taken, i.e. the number the next tip will receive. `0` on a fresh deploy. |
+| `get_jar(jar_id) -> Jar` | — | Read a jar's configuration. Panics with `JarNotFound` if the slug is free. |
+| `get_jar_owner(jar_id) -> Address` | — | Read just a jar's owner. Panics with `JarNotFound` if the slug is free. |
+| `get_split_count(jar_id) -> u32` | — | How many recipients a jar pays. Panics with `JarNotFound` if the slug is free. |
+| `preview_split(jar_id, amount) -> Vec<i128>` | — | What each recipient would receive from a tip of `amount`, in split order. Rejects amounts below the jar's minimum with `BelowMinTipAmount` as well as the amounts `tip` rejects; panics with `JarNotFound` if the slug is free. |
+| `jar_exists(jar_id) -> bool` | — | Whether the slug is already registered. |
+| `is_recipient(jar_id, address) -> bool` | — | Whether `address` appears in the jar's splits. Panics with `JarNotFound` if the slug is free. |
+| `get_min_tip_amount(jar_id) -> Option<i128>` | — | Read a jar's optional minimum tip amount. Returns `None` if no minimum is set. Panics with `JarNotFound` if the slug is free. |
+| `get_token() -> Address` | — | The USDC token address tips settle in. |
+| `get_admin() -> Address` | — | The contract admin recorded at deploy time. |
+| `get_limits() -> Limits` | — | The bounds this contract enforces: `bps_denom`, `max_recipients`, `max_message_len`. Reads no storage. |
 The **Errors** column lists the `tip_splitter` error codes a call can return,
 **in the order the contract checks them** — only the first failure a call hits
 is reported, so the order tells a client what it will actually see. An error is
@@ -301,6 +328,68 @@ the code, so flipping that profile setting cannot turn it into a bypass.
   `breakdown`, so no consumer has to reproduce this arithmetic after the fact
   either.
 
+## Authorization
+
+Every function that names an address in its signature requires that address's
+signature, and nothing else does. What a signature actually *commits to* is the
+part clients get asked about, because it decides when a previously signed
+transaction stops being valid.
+
+### `tip`
+
+A tipper authorizes the `tip` call itself, and the same authorization tree
+includes each token `transfer(from, recipient, share)` that `tip` performs. The
+transfers are nested under the contract invocation, carrying the exact recipient
+address and the exact amount.
+
+Consequences a client has to design for:
+
+- **The wallet shows one transfer per recipient, not one payment to the
+  contract.** A jar splitting 70/30 between two collaborators prompts the
+  supporter to approve two token transfers. Support teams get asked why the
+  tipper is never asked to send anything to the jar's contract address: the
+  contract never holds the funds, it moves them from the tipper straight to
+  each recipient.
+- **A tip signed against one set of splits cannot pay a different set.** If the
+  jar's splits (or its minimum tip amount) change between simulation and
+  submission, the signed transaction no longer matches what the contract will
+  actually do, and Stellar rejects it with `Error(Context, InvalidAction)`
+  before any funds move. This is the answer to the obvious question about a jar
+  owner "redirecting" a tip that is already in flight: they can call
+  `update_splits`, and the tip in transit simply fails. The old signature cannot
+  pay the new recipients.
+- **The client's recovery is to re-simulate and ask for a fresh signature.**
+  Without this documented the rejection looks random, because nothing in the
+  tip request changed — the jar did. On `InvalidAction`, re-simulate
+  (`preview_split` gives the same per-recipient amounts the new tree will
+  commit to), re-sign, and submit; a wallet that only retries the same
+  envelope will fail identically forever.
+- A tipper who is also a recipient is not paid, so no transfer appears for them
+  in the tree, and their notional share rolls into the last recipient's
+  transfer. See [`breakdown`](#tip--published-on-every-successful-tip).
+
+### Owner-only functions
+
+| Function | Authorizes | Tree contains |
+|----------|-----------|---------------|
+| `create_jar(owner, jar_id, splits)` | `owner` | The contract call only. No token moves. |
+| `update_splits(jar_id, splits)` | the jar's current `owner` | The contract call only. |
+| `transfer_jar_ownership(jar_id, new_owner)` | the jar's current `owner` | The contract call only. `new_owner` signs nothing. |
+| `set_min_tip_amount(jar_id, min_amount)` | the jar's current `owner` | The contract call only. |
+
+Each of these is a single contract-level invocation with no nested token
+transfers, so the signer approves one action, and the amount is not part of what
+is signed. Reading the jar (`get_jar`, `get_split_count`, `preview_split`, …)
+requires no authorization at all.
+
+The same staleness rule applies to a different degree: these calls do not commit
+to a jar's future state, so an `update_splits` signed against the current owner
+still succeeds after that owner changes — it just targets whichever jar the
+slug names at submission time.
+
+> A test that pins the `tip` authorization behaviour is tracked separately from
+> this document; link it here once it lands.
+
 ## Errors
 
 | Code | Name | Cause |
@@ -418,11 +507,18 @@ Lets indexers track the current minimum tip floor for a jar without polling `get
 ### `tip` — published on every successful tip
 
 - **Topics:** `(symbol "tip", jar_id: String)`
-- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128)>)`
+- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128)>, seq: u64, reference: Option<BytesN<32>>)`
 
 The backend indexer subscribes to this event to update balances, leaderboards,
 and notifications. `message` is at most 280 bytes, so the payload size is
 bounded and a `varchar(280)` column is enough to store it.
+
+The six elements occupy fixed, documented positions, in the order above, and
+that order is part of the public interface: `from`, `amount`, `message` and
+`breakdown` keep the positions they had, and `seq` and `reference` were appended.
+Both `tip` and `tip_with_ref` publish all six, so one decoder serves both entry
+points — an absent reference is an explicit `None` in position six, never a
+shorter tuple.
 
 `breakdown` lists one `(recipient, amount)` pair per split, **in split order**,
 so the event is self-describing: a consumer that wants per-collaborator
@@ -449,12 +545,66 @@ Note that `breakdown` is a snapshot, not the jar's current state. To ask
 whether an address is a recipient *now*, use
 [`is_recipient`](#confirming-you-are-a-recipient).
 
-> **Consumer impact.** The data tuple grew from three elements to four.
-> A decoder that reads it positionally — `decodeTipEvent` in `@novatip/sdk`,
-> and the backend indexer — must be updated to accept the fourth element
-> before it reads events from a contract built from this version. The first
-> three elements are unchanged and keep their positions, so a consumer that
-> ignores trailing elements is unaffected.
+#### `seq` — the tip's sequence number
+
+`seq` is a contract-wide counter, incremented once per successful tip, and is
+also the return value of `tip` / `tip_with_ref`. Numbers start at `1` and a
+reverted tip consumes none, so the sequence has no holes: an indexer that has
+stored `1..N` and reads `N` from `get_tip_count` has lost nothing, and a gap
+means its own scan is incomplete rather than that a tip never happened.
+
+This exists because consumers previously keyed on the transaction hash. The
+backend indexer upserts on `txHash` and the SDK's `TipEvent` tells callers to
+deduplicate on it — which holds only while there is one tip per transaction. A
+smart wallet batching two tips, or any client submitting tips from one account
+in a single transaction, puts several `tip` events in one transaction that all
+share that hash, and every tip after the first is dropped as a duplicate.
+`seq` is unique per tip by construction.
+
+`seq` is deliberately in the **data**, not the topics. The SDK's
+`tipTopicFilter` must have exactly one segment per published topic, so adding a
+third topic would make its existing two-segment filter match nothing — silently,
+for every consumer. `get_tip_count() -> u64` exposes the running total, `0` on a
+fresh deploy.
+
+#### `reference` — an optional client id
+
+`reference` lets the integration that started a tip recognise it when the event
+comes back through an indexer or a webhook. An embeddable button, a stream
+overlay, and a Discord/Telegram bot each create something off-chain first (a
+pending alert, a bot command, a checkout session) and then wait for the matching
+`tip` event. Sender, amount and message are none of them unique, and the message
+is visible to the creator, so it cannot carry an opaque id.
+
+The value is opaque to the contract and the contract's role stops at echoing it:
+
+- it is **not stored** — no key is written, and reading the jar or the tip count
+  is unaffected by whether a tip carried one;
+- it is **not checked for uniqueness** — two integrations may send the same
+  reference, and two tips in the same jar may carry it. Reconciling a collision
+  is the consumer's job; if a consumer needs uniqueness it must use `seq`, which
+  the contract does guarantee;
+- it **costs nothing when absent** — `tip` passes `None`, and an absent
+  reference still occupies position six.
+
+It is exactly 32 bytes (`Option<BytesN<32>>`): enough for a binary UUID, a
+`sha256` tag, or a big-endian primary key, and bounded so the payload cannot grow
+the way an unbounded string would. The entry point is `tip_with_ref`; `tip` is
+unchanged and remains the positional call the SDK and the web tip form use.
+
+> **Consumer impact.** The data tuple grew from four elements to six. A
+> positional decoder — `decodeTipEvent` in `@novatip/sdk`, and the backend
+> indexer — must be updated to accept `seq` and `reference` before it reads
+> events from a contract built from this version. The first four elements are
+> unchanged and keep their positions, so a consumer that ignores trailing
+> elements is unaffected. `tip` now also *returns* a `u64` where it previously
+> returned nothing; callers that ignored the empty result keep working, and the
+> web tip form can use the returned number to link the supporter to the tip they
+> just sent.
+>
+> An earlier change in the same section took the tuple from three elements to
+> four by appending `breakdown`; that wording describes the `breakdown` addition
+> and is kept for the migration note.
 
 ## Jar discovery — design note
 
@@ -509,8 +659,13 @@ when started from any directory.
 ```bash
 ./scripts/deploy.sh        # deploys, writes .contract-id
 ./scripts/create-jar.sh    # registers an example jar
+./scripts/set-min-tip.sh   # sets (or clears) a jar's minimum tip
+./scripts/transfer-jar.sh  # hands a jar to a new owner
 ```
 
+See [`.env.example`](../.env.example) for required variables, and the
+[README's scripts section](../README.md#scripts) for what each script needs and
+how `MIN_TIP=none` reaches `Option::None`.
 Once a jar exists:
 
 ```bash
