@@ -4,7 +4,7 @@
 # transitive crates on newer editions than the pinned toolchain can parse
 # (proptest pulling a getrandom that needs edition2024, for instance).
 resolver = "3"
-members = ["contracts/*"]
+members = ["contracts/*", "examples/*"]
 
 [workspace.package]
 rust-version = "1.84"
