@@ -1,0 +1,33 @@
+# cargo-deny configuration (#132)
+#
+# Local: cargo install cargo-deny && cargo deny check
+# CI runs this on PRs and on a weekly schedule (new advisories appear
+# without repository changes).
+#
+# When a new advisory fails CI:
+# 1. Prefer upgrading the affected dependency.
+# 2. If no fix exists, add a temporary [[bans.ignore]] or [advisories] ignore
+#    with the RUSTSEC id and a comment saying why / when it can be removed.
+
+[advisories]
+version = 2
+yanked = "deny"
+# Fail on vulnerabilities; unmaintained crates warn only (proptest etc. are
+# often flagged unmaintained while still fine for dev-deps).
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+version = 2
+# This crate is MIT; allow the licenses actually present in the lockfile.
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Unicode-DFS-2016", "Unicode-3.0", "Zlib", "MPL-2.0"]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
