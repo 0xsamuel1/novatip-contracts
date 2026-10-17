@@ -52,7 +52,7 @@ one belongs to a jar, the other to a `(jar, supporter)` pair.
 | Function | Auth | Description |
 |----------|------|-------------|
 | `__constructor(admin, token)` | — | Deploy-time init. Stores the admin and USDC token address, and puts that token on the tip allowlist as its first entry. |
-| `create_jar(owner, jar_id, splits)` | `owner` | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. |
+| `create_jar(owner, jar_id, splits)` | `owner`, plus the `registrar`'s co-signature over `(jar_id, owner)` while one is registered | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. See [the registrar gate](#the-jar-registrar-and-its-trust-model-178). |
 | `update_splits(jar_id, splits)` | jar `owner`, plus every current recipient whose share **decreases or is removed** when the jar is locked | Replace a jar's splits. Subject to the same validation as `create_jar`. On a locked jar the owner alone cannot cut a collaborator — see [`lock_splits`](#locking-a-jars-splits). Emits a `splits` event. |
 | `lock_splits(jar_id)` | jar `owner` | Lock a jar so `update_splits` needs each reduced/removed recipient's consent. Emits a `lock` event with data `true`. |
 | `unlock_splits(jar_id)` | jar `owner` **and every current recipient** | Remove the lock. Consent mirrors a reduction: all recipients must sign, or the owner could disarm the lock and then cut shares. Emits a `lock` event with data `false`. |
@@ -63,13 +63,18 @@ one belongs to a jar, the other to a `(jar, supporter)` pair.
 | `tip(from, jar_id, amount, message)` | `from` | Move `amount` USDC out of `from` and route it across the jar's recipients. A recipient who cannot receive the token has their share **escrowed in the contract** (see `get_held`/`withdraw_held`) instead of reverting the tip. Emits a `tip` event carrying the per-recipient breakdown. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
 | `get_held(recipient) -> i128` | — | How much the contract is holding for `recipient` because a past tip could not deliver their share. `0` when nothing is held. |
 | `withdraw_held(recipient)` | `recipient` | Pay a recipient their held balance once they can receive again. Rejected with `NothingHeld` when nothing is owed. Emits a `withdraw` event. |
-| `create_recurring(supporter, jar_id, amount, period_ledgers, message) -> u128` | `supporter` | Register a recurring-tip **record** (no funds move). Validates the jar exists and the amount/message pass the same checks `tip` applies; `period_ledgers` must be non-zero. Assigns a fresh id, stores the entry with its first `next_due_ledger`, and emits a `recr_add` event. Returns the id. |
+| `create_recurring(supporter, jar_id, amount, period_ledgers, message) -> u128` | `supporter` | Register a recurring-tip schedule. Validates the jar exists and the amount/message pass the same checks `tip` applies; `period_ledgers` must be non-zero. Assigns a fresh id, stores the entry with its first `next_due_ledger`, and emits a `recr_add` event. Returns the id. The schedule moves funds through `collect_recurring`: the supporter must have approved this contract as a token spender for at least `amount` per period. |
 | `cancel_recurring(id)` | the entry's `supporter` | Remove a recurring-tip record. Emits a `recr_del` event. |
 | `get_recurring(id) -> Recurring` | — | Read a stored recurring-tip entry. Panics with `RecurringNotFound` for an unknown id. |
+| `collect_recurring(id)` | — (any caller, typically a keeper) | Collect **one due period** of a recurring tip (#175). Pays the schedule's `amount` from the supporter's approved allowance with `transfer_from` (this contract is the spender), split by the same arithmetic as `tip`, and publishes the identical `tip` event. `next_due_ledger` advances by exactly `period_ledgers`. Too early — `NotDue`; allowance below `amount` (exhausted or expired) — `InsufficientAllowance`; supporter balance below `amount` — `InsufficientBalance`; all raised before any transfer, with zero state change. See [collecting recurring tips](#collecting-a-due-recurring-tip-175). |
 | `tip(from, jar_id, amount, message)` | `from` | Transfer `amount` of the **default token** from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown and the token paid in. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
 | `tip_in_token(from, jar_id, token, amount, message)` | `from` | Same split, paid in `token`, which must be on the allowlist — otherwise `TokenNotAllowed`, raised before any transfer. The jar minimum applies only when `token` is the default token. Emits the same `tip` event. |
 | `allow_token(token)` | contract `admin` | Add `token` to the allowlist. Idempotent. Emits a `tk_allow` event carrying the admin who authorised it. |
 | `disallow_token(token)` | contract `admin` | Remove `token` from the allowlist. Refuses the default token with `CannotDisallowDefault`. Emits a `tk_dis` event carrying the admin. |
+| `set_tip_hook(hook)` | contract `admin` | Register or clear (`None`) the post-tip hook contract (#176). Emits a `tip_hook` event carrying the admin who made the change. See [the post-tip hook](#the-post-tip-hook-176). |
+| `get_tip_hook() -> Option<Address>` | — | The registered hook, or `None` when tips settle without one. |
+| `set_registrar(registrar)` | contract `admin` | Register or clear (`None`) the registrar whose co-signature `create_jar` requires (#178). Emits a `reg_set` event carrying the admin. See [the registrar gate](#the-jar-registrar-and-its-trust-model-178). |
+| `get_registrar() -> Option<Address>` | — | The registrar `create_jar` currently requires, or `None` when jar creation is permissionless. |
 | `tip(from, jar_id, amount, message) -> u64` | `from` | Transfer `amount` USDC from `from`, split across the jar's recipients. Emits a `tip` event carrying the per-recipient breakdown and this tip's sequence number, and returns that number. Rejects amounts below the jar's minimum with `BelowMinTipAmount`. |
 | `tip_with_ref(from, jar_id, amount, message, reference) -> u64` | `from` | Identical to `tip`, plus an optional 32-byte opaque `reference` echoed in the `tip` event. Same transfers, same validation, same counter — both entry points call one internal implementation. |
 | `get_tip_count() -> u64` | — | How many tips the contract has taken, i.e. the number the next tip will receive. `0` on a fresh deploy. |
@@ -77,6 +82,7 @@ one belongs to a jar, the other to a `(jar, supporter)` pair.
 | `get_jar_owner(jar_id) -> Address` | — | Read just a jar's owner. Panics with `JarNotFound` if the slug is free. |
 | `get_split_count(jar_id) -> u32` | — | How many recipients a jar pays. Panics with `JarNotFound` if the slug is free. |
 | `preview_split(jar_id, amount) -> Vec<i128>` | — | What each recipient would receive from a tip of `amount`, in split order. Rejects amounts below the jar's minimum with `BelowMinTipAmount` as well as the amounts `tip` rejects; panics with `JarNotFound` if the slug is free. |
+| `preview_tip(jar_id, from, amount) -> Vec<i128>` | — | What each recipient would **actually** receive from a `tip` of `amount` sent by `from` (#177), in split order: the sender-aware sibling of `preview_split`. A recipient who is the sender is reported as `0`, exactly as the `tip` event's breakdown records them, because their share rolls into the last recipient. Computed by the same private helper the tip payout loop uses, so preview and payout cannot drift. Rejects what `tip` rejects. |
 | `jar_exists(jar_id) -> bool` | — | Whether the slug is already registered. |
 | `is_recipient(jar_id, address) -> bool` | — | Whether `address` appears in the jar's splits. Panics with `JarNotFound` if the slug is free. |
 | `get_min_tip_amount(jar_id) -> Option<i128>` | — | Read a jar's optional minimum tip amount. Returns `None` if no minimum is set. Panics with `JarNotFound` if the slug is free. |
@@ -95,7 +101,7 @@ written as raised only when every earlier check has passed.
 | Function | Auth | Errors (in check order) | Description |
 |----------|------|-------------------------|-------------|
 | `__constructor(admin, token)` | — | — | Deploy-time init. Stores the admin and USDC token address. |
-| `create_jar(owner, jar_id, splits)` | `owner` | `InvalidJarId` → `JarExists` → `SplitsEmpty` → `TooManyRecipients` → `SplitOutOfRange` / `DuplicateRecipient` (per entry) → `SplitSumNot100Pct` | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. Emits a `jar_crtd` event. |
+| `create_jar(owner, jar_id, splits)` | `owner` (+ registrar co-auth when set) | `InvalidJarId` → `JarExists` → `SplitsEmpty` → `TooManyRecipients` → `SplitOutOfRange` / `DuplicateRecipient` (per entry) → `SplitSumNot100Pct` → Soroban auth error (missing registrar co-signature, #178) | Register a new jar. Fails if the slug is empty, over `MAX_JAR_ID_LEN` bytes, already exists, or splits are invalid. The registrar's co-signature is demanded only after validation passes, so a malformed request never burns one. Emits a `jar_crtd` event. |
 | `update_splits(jar_id, splits)` | jar `owner` | `JarNotFound` → `SplitsEmpty` → `TooManyRecipients` → `SplitOutOfRange` / `DuplicateRecipient` (per entry) → `SplitSumNot100Pct` | Replace a jar's splits. Subject to the same validation as `create_jar`. Emits a `splits` event. |
 | `set_min_tip_amount(jar_id, min_amount)` | jar `owner` | `JarNotFound` → `InvalidAmount` | Set or clear an optional minimum tip amount for a jar. `min_amount` must be strictly positive (`> 0`) or `None` to clear. Emits a `min_tip` event. |
 | `transfer_jar_ownership(jar_id, new_owner)` | current jar `owner` | `JarNotFound` | Hand control of a jar to `new_owner`. Splits are unchanged; the new owner does not need to authorize. Emits a `jar_xfer` event carrying both owners. |
@@ -104,6 +110,8 @@ written as raised only when every earlier check has passed.
 | `get_jar_owner(jar_id) -> Address` | — | `JarNotFound` | Read just a jar's owner. Panics with `JarNotFound` if the slug is free. |
 | `get_split_count(jar_id) -> u32` | — | `JarNotFound` | How many recipients a jar pays. Panics with `JarNotFound` if the slug is free. |
 | `preview_split(jar_id, amount) -> Vec<i128>` | — | `JarNotFound` → `BelowMinTipAmount` → `InvalidAmount` | What each recipient would receive from a tip of `amount`, in split order. Rejects amounts below the jar's minimum with `BelowMinTipAmount` as well as the amounts `tip` rejects; panics with `JarNotFound` if the slug is free. |
+| `preview_tip(jar_id, from, amount) -> Vec<i128>` | — | `InvalidAmount` (amount ≤ 0) → `JarNotFound` → `BelowMinTipAmount` → `InvalidAmount` (a share truncates to zero, or `amount * bps` overflows) | The sender-aware preview (#177): exactly the amounts `tip` will transfer for `from`, helper-shared with the payout. |
+| `collect_recurring(id)` | — | `RecurringNotFound` → `NotDue` → `JarNotFound` → `NotInitialized` → `InsufficientAllowance` → `InsufficientBalance` | Collect one due period of a recurring schedule through the supporter's token allowance (#175). Publishes the same `tip` event and fires the post-tip hook. |
 | `jar_exists(jar_id) -> bool` | — | — | Whether the slug is already registered. Reads one key and returns a plain `bool`; never panics on a free slug. |
 | `is_recipient(jar_id, address) -> bool` | — | `JarNotFound` | Whether `address` appears in the jar's splits. Panics with `JarNotFound` if the slug is free. |
 | `get_min_tip_amount(jar_id) -> Option<i128>` | — | `JarNotFound` | Read a jar's optional minimum tip amount. Returns `None` if no minimum is set. Panics with `JarNotFound` if the slug is free. |
@@ -253,12 +261,37 @@ at all describes a tip that can go through:
   would read as a jar that pays nobody.
 
 One caveat: `tip` withholds a recipient's share when that recipient is also the
-tipper, rather than making them pay themselves. `preview_split` does not take a
-`from` address, so it reports every recipient's full share. A client whose
-connected wallet appears in the jar's splits should account for that itself.
-The `tip` event's [`breakdown`](#tip--published-on-every-successful-tip) does
-know who tipped, so it is the authoritative record of what each recipient was
-actually paid.
+tipper — rather than making them pay themselves — and rolls the withheld share
+into the **last** recipient. `preview_split` does not take a `from` address, so
+it reports every recipient's full share and disagrees with the actual payout
+for a tipper who is on the jar. Do not redo that arithmetic client-side: call
+[`preview_tip`](#previewing-a-tip-for-a-known-sender) instead, which takes the
+sender and matches the payout exactly.
+
+### Previewing a tip for a known sender
+
+`preview_tip(jar_id, from, amount)` answers the same question as
+`preview_split` but *for a specific tipper* (#177). It returns what `tip` will
+actually transfer to each recipient, in split order: a recipient who is the
+sender is reported as `0` — the same number the `tip` event's breakdown records
+for them — and their notional share rolls into the last recipient, as the tip
+does it.
+
+```
+splits:  alice 50%, bob 30%, carol 20%
+preview_split(jar_id, 1000)          -> [500, 300, 200]
+preview_tip(jar_id, alice, 1000)     -> [0, 300, 700]
+preview_tip(jar_id, stranger, 1000)  -> [500, 300, 200]
+```
+
+The numbers come from the **same private helper** (`payout_amounts`) that
+`tip`'s transfer loop consumes, so the view and the payout are one
+implementation and cannot drift apart — whatever rule change #66 eventually
+makes about the tipper's share, both follow it together. Validation mirrors
+`tip` (same errors, same precedence); like `preview_split` it reads no
+balance, so it never says whether `from` can pay, and a share that ends up
+escrowed as `held` at transfer time (#171) is still reported, because that
+amount leaves the tipper either way.
 
 ### Setting a minimum tip amount
 
@@ -450,22 +483,35 @@ slug names at submission time.
 | 10 | `SplitsEmpty` | The splits list is empty. |
 | 11 | `SplitOutOfRange` | An entry has `bps == 0` or `bps > 10_000`. Checked per entry, before the sum. |
 | 12 | `SplitSumNot100Pct` | The shares sum to something other than exactly 10 000 bps, including a sum that would overflow `u32`. |
-| 13 | `BelowMinTipAmount` | Tip amount is strictly below the jar's configured minimum tip amount. Raised by `tip`, by `preview_split`, and by `tip_in_token` when it is paid in the default token. |
-| 14 | `TokenNotAllowed` | `tip_in_token` was given a token the admin has not allowed. Raised before any transfer, so a rejected tip moves nothing. |
-| 15 | `CannotDisallowDefault` | `disallow_token` was given the deploy-time token, which `tip` always pays through and which therefore stays non-removable. |
-| 16 | `StatsOverflow` | A running tip total would not fit `u64`/`i128`. Effectively unreachable; the counters use checked arithmetic so an exhaustion reports as this code rather than a wasm trap. |
-| 13 | `BelowMinTipAmount` | Tip amount is strictly below the jar's configured minimum tip amount. Raised by `tip` and `preview_split`. |
+| 13 | `BelowMinTipAmount` | Tip amount is strictly below the jar's configured minimum tip amount. Raised by `tip`, by `preview_split`, by `preview_tip`, and by `tip_in_token` when it is paid in the default token. |
 | 14 | `NotRecipient` | `leave_jar` was called for an address not present in the jar's splits. |
 | 15 | `SoleRecipient` | `leave_jar` would empty the jar — the caller is its only recipient. |
-| 16 | `RecurringNotFound` | `cancel_recurring` / `get_recurring` named an id that does not exist. |
+| 16 | `RecurringNotFound` | `cancel_recurring` / `get_recurring` / `collect_recurring` named an id that does not exist. |
 | 17 | `InvalidPeriod` | A recurring tip was registered with a zero `period_ledgers` (or its due-ledger computation would overflow). |
 | 18 | `NothingHeld` | `withdraw_held` was called for a recipient the contract holds nothing for. |
-| 14 | `InsufficientBalance` | Tip amount exceeds the sender's USDC balance. Checked once per `tip`, before any transfer. |
+| 19 | `TokenNotAllowed` | `tip_in_token` was given a token the admin has not allowed. Raised before any transfer, so a rejected tip moves nothing. |
+| 20 | `CannotDisallowDefault` | `disallow_token` was given the deploy-time token, which `tip` always pays through and which therefore stays non-removable. |
+| 21 | `StatsOverflow` | A running tip total would not fit `u64`/`i128`. Effectively unreachable; the counters use checked arithmetic so an exhaustion reports as this code rather than a wasm trap. |
+| 22 | `InsufficientBalance` | Tip amount exceeds the sender's token balance. Checked once per `tip` and once per `collect_recurring`, before any transfer. |
+| 23 | `NotDue` | `collect_recurring` was called before the schedule's `next_due_ledger`. A typed no-op: the entry is untouched and the same call succeeds once the ledger is reached. |
+| 24 | `InsufficientAllowance` | `collect_recurring` found the supporter's allowance for this contract below the scheduled amount. An expired allowance reads as zero and fails the same check. Raised before any transfer, so nothing moves. |
 
 Error codes are part of the public interface: `@novatip/sdk` and the frontend
 both map these numbers to user-facing messages. New variants are **appended**
-and existing values are never renumbered, which is why code 4 stays in place
+and existing values are not renumbered, which is why code 4 stays in place
 rather than being removed.
+
+> **One renumbering did happen, and it had to.** By the time the allowlist,
+> `leave_jar`, and the recurring-tip PRs were merged, `main` carried a three-way
+> collision: codes 14, 15, and 16 were each claimed by two variants
+> (`NotRecipient`/`TokenNotAllowed`, `SoleRecipient`/`CannotDisallowDefault`,
+> `RecurringNotFound`/`StatsOverflow`), and `InsufficientBalance` also sat on 14.
+> Duplicate codes are not decidable, so the later-added side of every collision
+> moved to a fresh number: `TokenNotAllowed` 14 → 19, `CannotDisallowDefault`
+> 15 → 20, `StatsOverflow` 16 → 21, `InsufficientBalance` 14 → 22. Codes 1–18
+> as consumed by the *working* deployments (the original ladder) are unchanged;
+> anything wired to the colliding 14/15/16 of a `main` build could not have
+> worked deterministically anyway.
 
 ### Token failures keep the token's own code
 
@@ -484,9 +530,9 @@ contract does, so the numbers overlap:
 (The SAC also uses 3, 6, 8 and 9, which likewise coincide with this
 contract's codes of the same numbers.)
 
-The one exception is the empty wallet: `tip` reads the sender's token
-`balance` once, before the first transfer, and fails with the contract's own
-code 14 `InsufficientBalance` when `balance < amount`. A tip larger than the
+The one exception is the empty wallet: `tip` (and `collect_recurring`) read
+the sender's token `balance` once, before the first transfer, and fail with
+the contract's own code 22 `InsufficientBalance` when `balance < amount`. A tip larger than the
 sender's balance therefore never reaches the token, so it can never be
 mislabelled as "Add at least one collaborator".
 
@@ -560,37 +606,39 @@ Lets indexers track the current minimum tip floor for a jar without polling `get
 ### `tip` — published on every successful tip
 
 - **Topics:** `(symbol "tip", jar_id: String)`
-- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128, bool)>)`
-- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128)>, token: Address)`
-- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128)>, seq: u64, reference: Option<BytesN<32>>)`
+- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128, bool)>, token: Address, seq: u64, reference: Option<BytesN<32>>)
+
+  Published by `tip`, `tip_with_ref`, `tip_in_token`, and — with the supporter
+  as `from` and an explicit `None` reference — `collect_recurring` (#175), all
+  through one internal settle path, so one decoder serves every on-chain tip.
 
 The backend indexer subscribes to this event to update balances, leaderboards,
 and notifications. `message` is at most 280 bytes, so the payload size is
 bounded and a `varchar(280)` column is enough to store it.
 
 `breakdown` lists one `(recipient, moved, held)` triple per split, **in split
-order**, so the event is self-describing: a consumer that wants per-collaborator
-The six elements occupy fixed, documented positions, in the order above, and
-that order is part of the public interface: `from`, `amount`, `message` and
-`breakdown` keep the positions they had, and `seq` and `reference` were appended.
-Both `tip` and `tip_with_ref` publish all six, so one decoder serves both entry
-points — an absent reference is an explicit `None` in position six, never a
-shorter tuple.
+order**, so the event is self-describing: a consumer that wants
+per-collaborator earnings never has to fetch the jar and redo the arithmetic.
+That matters because a recomputed figure can disagree with the contract's —
+the jar's splits may have been changed by `update_splits` between the tip and
+the read, and the last recipient's share includes rounding dust that depends
+on the exact amount. The `moved` values sum to at most `amount`: a recipient
+who is also the sender is reported with `moved = 0`, and their notional share
+rolls into the last recipient instead of transferring at all (see below).
 
-`breakdown` lists one `(recipient, amount)` pair per split, **in split order**,
-so the event is self-describing: a consumer that wants per-collaborator
-earnings never has to fetch the jar and redo the arithmetic. That matters
-because a recomputed figure can disagree with the contract's — the jar's splits
-may have been changed by `update_splits` between the tip and the read, and the
-last recipient's share includes rounding dust that depends on the exact
-amount. The `moved` values always sum to `amount`.
+The seven elements occupy fixed, documented positions, in the order above,
+and that order is part of the public interface: `from`, `amount`, `message`
+and `breakdown` keep the positions they had, and `token`, `seq` and
+`reference` were appended after them. Every settle path publishes all seven,
+so one decoder serves all entry points — an absent reference is an explicit
+`None` in position seven, never a shorter tuple.
 
 The `held` flag distinguishes a **delivered** share (`false`) from one the
 contract could not deliver and has escrowed for later withdrawal (`true`, #171).
 For a held triple, `moved` is the amount the contract took into custody for that
 recipient.
 
-The pairs report **what each transfer actually moved**, not the notional
+The triples report **what each transfer actually moved**, not the notional
 `amount * bps / 10_000` that [`preview_split`](#previewing-a-tip) quotes. The
 two differ in one case: `tip` skips paying a recipient who is also the sender,
 so that entry reports `0` where the preview would have shown their full share. The recipient is
@@ -600,7 +648,7 @@ the running total, the final recipient absorbs it — so a self-tip shows up as 
 `0` entry and a correspondingly larger one at the end.
 
 `breakdown.len()` equals the jar's split count at the moment of the tip, so it
-is at most `MAX_RECIPIENTS` (20) pairs — see
+is at most `MAX_RECIPIENTS` (20) entries — see
 [`get_limits`](#reading-the-contracts-limits). The payload stays bounded.
 
 Note that `breakdown` is a snapshot, not the jar's current state. To ask
@@ -639,14 +687,31 @@ address's withdrawals.
 - **`recr_add` Topics:** `(symbol "recr_add", supporter: Address)`, **Data:** `id: u128`
 - **`recr_del` Topics:** `(symbol "recr_del", supporter: Address)`, **Data:** `id: u128`
 
-Publishes the assigned schedule id. A recurring tip is a **record**, not a
-payment — a due schedule still results in an ordinary `tip`; automatic
-collection is out of scope (it needs the supporter to approve the contract as a
-token spender).
+Publishes the assigned schedule id (and `recr_del` the id it removed).
+A schedule becomes a payment rail through `collect_recurring` (#175): the
+supporter approves this contract as a token spender, and any keeper collects
+due periods one at a time. Each collection publishes the ordinary `tip` event,
+so indexers need no separate decoder for recurring payments.
 
 > The `splits` event is also emitted by `leave_jar` (#172), not only by
 > `update_splits`, so an indexer refreshes its cached splits after a recipient
 > removes themselves.
+
+### `tip_hook` — published on every `set_tip_hook`
+
+- **Topics:** `(symbol "tip_hook", admin: Address)`
+- **Data:** `hook: Option<Address>` (`None` when the hook was cleared)
+
+Records who changed the post-tip hook configuration and to what, so the
+setting's history is attributable in the event log (#176).
+
+### `reg_set` — published on every `set_registrar`
+
+- **Topics:** `(symbol "reg_set", admin: Address)`
+- **Data:** `registrar: Option<Address>` (`None` when cleared)
+
+Records every installation or removal of the `create_jar` registrar (#178),
+including the moment the squatting gate goes up or down.
 
 ## Locking a jar's splits
 
@@ -735,10 +800,16 @@ with the counters disabled:
 
 | | without totals | with totals | difference |
 |---|---|---|---|
-| Ledger writes | 3 | 5 | **+2 entries** |
-| Bytes written | 520 | 924 | **+404 bytes** |
-| Persistent rent bumps | 2 | 4 | **+2** |
-| Modelled CPU instructions | ~214k | ~268k | **~+25%** |
+| Ledger writes | 4 | 6 | **+2 entries** |
+| Bytes written | 884 | 1288 | **+404 bytes** |
+| Persistent rent bumps | 3 | 5 | **+2** |
+
+The write columns were re-measured against the merged payout path — the
+"without totals" baseline is now 4 entries, not 3, because the tip sequence
+counter writes the contract instance each tip and the escrow fallback (#171)
+enlarged the per-tip footprint. The **differential the #167 PR documented still
+holds exactly: two writes, 404 bytes, two rent bumps per tip**. The modelled
+CPU delta predates those merges and was not re-measured here.
 
 The difference is flat, not cumulative: a second tip by the same supporter to
 the same jar rewrites the same two entries and adds no new ones (the test
@@ -808,6 +879,131 @@ never interprets magnitude, so the same arithmetic is correct for any asset —
 which is exactly what makes an EURC tip of 100 pay 70/30 just as a USDC tip of
 100 does.
 
+## Collecting a due recurring tip (#175)
+
+`create_recurring` stores a schedule; `collect_recurring(id)` moves the money.
+The payment rail is the **token allowance** the supporter granted this
+contract: an `approve` on the token with `spender = tip_splitter` covering at
+least one period's `amount`. With that in place, *anyone* may call
+`collect_recurring` — typically the backend keeper or the jar's creator — and
+no supporter signature is requested or needed.
+
+A collection:
+
+- checks the schedule exists (`RecurringNotFound`), that the ledger has
+  reached `next_due_ledger` (`NotDue`), that the allowance covers `amount`
+  (`InsufficientAllowance` — an expired allowance reads as zero and fails the
+  same check), and that the supporter's balance covers it
+  (`InsufficientBalance`); every one of these is raised **before any funds
+  move**, so a rejected call changes nothing, and an early call does not
+  cancel the schedule — the same call succeeds once the ledger is reached;
+- splits `amount` with the **same** arithmetic `tip` uses (the shared
+  `payout_amounts` helper: basis-point shares, dust to the last recipient,
+  supporter-is-recipient skipped), and moves each recipient's share with
+  `transfer_from` with the contract itself as the spender; a recipient who
+  cannot receive is escrowed exactly as in `tip` (#171);
+- publishes the **identical `tip` event** — supporter as `from`, the stored
+  message, breakdown, token, sequence number, and an explicit absent
+  reference — so the indexer, webhooks and analytics see a collected
+  installment and a manual tip as the same thing;
+- fires the post-tip hook (#176) like any settled tip;
+- advances `next_due_ledger` by **exactly one `period_ledgers`**, anchored on
+  the old due ledger rather than on "now". At most one period is collected per
+  call, so a keeper that was offline for months cannot drain months in one
+  call; a backlogged keeper catches up one installment per call, and the
+  supporter's allowance is the hard ceiling on the total — revoking it (or
+  `cancel_recurring`) stops collections dead.
+
+The per-jar minimum tip is enforced at registration, not re-enforced at
+collection: a minimum raised later must not silently strand schedules already
+registered under the old floor. A supporter who wants the new floor honoured
+cancels and re-registers.
+
+## The post-tip hook (#176)
+
+The admin can register one optional contract — the `supporter_badge` in the
+roadmap — that is notified after **every** settled tip:
+
+```rust
+set_tip_hook(hook: Option<Address])   // admin-only; None clears
+get_tip_hook() -> Option<Address>     // the current hook, if any
+```
+
+### The interface a hook must implement
+
+The contract exposes it as a `#[contractclient]` trait (`TipHook`), so a hook
+contract can code against it directly:
+
+```rust
+#[contractclient(name = "TipHookClient")]
+pub trait TipHook {
+    fn on_tip(env: Env, jar_id: String, from: Address, amount: i128);
+}
+```
+
+`on_tip` receives the jar id, the tipper, and the tip amount. It is called
+with no authorisation requested and its return value is ignored.
+
+### When and how it is called
+
+Every settle path — `tip`, `tip_with_ref`, `tip_in_token`, and a
+`collect_recurring` installment — fires the hook **last**, after all transfers
+and the `tip` event, through `env.try_invoke_contract`:
+
+- If the hook **panics or returns an error, the failure is caught and
+  discarded**: the tip has already paid out and published, and stays settled.
+  A broken badge contract must never stop a creator being paid.
+- If the hook burns the transaction's remaining instruction budget, the tip
+  fails too. This is inherent to the Soroban budget model — `try_invoke_contract`
+  can catch a contract error, but an out-of-gas abort tears down the whole
+  transaction and cannot be caught anywhere inside it. **Budget exhaustion in
+  a hook is therefore the one way a hook can still revert a tip.**
+
+The combination is why the hook is an opt-in, admin-controlled pointer:
+admins should point it at a contract they have audited and budget-checked,
+and `get_tip_hook` lets anyone verify what is wired in. Every change emits a
+`tip_hook` event carrying the admin who made it. With no hook set, tips behave
+exactly as before the feature existed.
+
+## The jar registrar and its trust model (#178)
+
+Novatip derives a jar's on-chain id from the claimed slug (`@alice` for
+`/alice`). The backend guarantees slug uniqueness **in its database**, but the
+chain does not know about the claim: until Alice finishes onboarding, anyone
+can call `create_jar("@alice", …)` first and strand her with an "already
+registered on-chain" error that has no on-chain recourse.
+
+`set_registrar(registrar: Option<Address>)` (admin-only) names a contract
+whose **co-signature** `create_jar` then requires:
+
+```rust
+registrar.require_auth_for_args((jar_id.clone(), owner.clone()).into_val(&env));
+```
+
+- The co-signature is over the exact `(jar_id, owner)` pair being registered —
+  a signature for a different slug or a different owner authorises nothing.
+- The check runs **after** all input validation and the duplicate-slug check,
+  so a malformed request never burns a co-signature, and a rejected call
+  stores nothing.
+- While no registrar is set, `create_jar` behaves **exactly as before**: owner
+  auth only. Existing deployments and third-party users of the contract are
+  untouched until the admin opts in — which is the reversible half of the
+  rollout the issue asks for.
+- Every installation or removal emits a `reg_set` event carrying the admin.
+
+**The trust model, stated plainly.** The intended registrar is the Novatip
+backend itself: it signs the authorisation entry when a slug claim succeeds,
+and the creator's wallet submits the transaction as today. That converts
+slug-squatting from *anyone on the public internet* into *only whoever holds
+the backend's signing key* — and the backend was designed to hold no keys, so
+this mechanism does not decide the trust question, it only makes it concrete
+and reversible: an operational decision (key custody, probably a dedicated
+low-privilege hot wallet that can sign nothing else) the team can take — or
+roll back by clearing the registrar — without redeploying the contract. What
+the gate never does is touch existing jars: the registrar can only gate
+creations of *free* slugs; owners, splits and funds of registered jars remain
+exactly as unreachable to it as they were before.
+
 ## Detecting the interface version
 
 ```rust
@@ -830,8 +1026,15 @@ changes. Do not bump it for an internal refactor, a new storage key, or a doc
 edit — none of those are visible to a consumer, and a version that changes when
 nothing observable did is a version consumers stop trusting.
 
-This PR ships `version() == 1`, which describes the interface as of this build:
-`tip` events with five elements, totals views, and the token allowlist.
+This build ships `version() == 2`. Version 1 covered the escrow/`held`
+breakdown, the token allowlist, the totals views, and the sequence-numbered
+`tip` event. This PR adds four functions and one view beyond that point —
+`collect_recurring`, `preview_tip`, `set_tip_hook`/`get_tip_hook`,
+`set_registrar`/`get_registrar` — plus the `tip_hook` and `reg_set` events,
+the single canonical seven-element `tip` event data, and the repair of the
+14/15/16 error-code collision by renumbering the affected codes to 19–22.
+Every one of those is a function, event-shape, or error-code change, so the
+constant moves up under the rule above.
 
 **How a client should use it.** Treat an unrecognised number as "newer than I
 was built for", not as an error. Every field a lower version documented still

@@ -4,12 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # New RustSec advisories appear without repository changes (#132).
+    - cron: "17 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The Stellar CLI does not ship with the plain-rust CI above, so this job
+  # The Stellar CLI does not ship with the plain-rust CI below, so this job
   # installs a pinned version — deliberately the release line matching the
   # soroban-sdk the contract builds against — and checks that
   # docs/CONTRACT.md's function and error tables match the built interface.
@@ -33,24 +36,50 @@ jobs:
       - name: Show toolchain
         run: rustup show
 
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
+      # rust-toolchain.toml already lists wasm32v1-none; no extra rustup target add.
 
       - name: Check CONTRACT.md against the built contract
         run: ./scripts/check-docs.sh
 
+      - name: Check public interface snapshot (#134)
+        run: ./scripts/check-interface.sh
+
+  msrv-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust-toolchain vs workspace rust-version (#133)
+        run: ./scripts/check-msrv.sh
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
   build-test:
     runs-on: ubuntu-latest
+    env:
+      STELLAR_VERSION: 22.0.0
     steps:
       - uses: actions/checkout@v4
 
       # rustup reads rust-toolchain.toml and installs the pinned channel,
-      # rustfmt, and clippy automatically.
+      # rustfmt, clippy, and wasm32v1-none automatically.
       - name: Show toolchain
         run: rustup show
 
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
+      - name: Install pinned Stellar CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL -o stellar-cli.tar.gz \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_VERSION}/stellar-cli-${STELLAR_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar xzf stellar-cli.tar.gz
+          install stellar /usr/local/bin/stellar
+          stellar --version
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -74,12 +103,11 @@ jobs:
 
       - name: Build wasm
         run: cargo build --locked --target wasm32-unknown-unknown --release
+      # Build the artifact deployments actually ship (#131): stellar contract
+      # build targets wasm32v1-none and produces the same layout as
+      # scripts/deploy.sh. The size check then measures that file.
+      - name: Build wasm (same as deploy)
+        run: stellar contract build
 
-      # Contract size drives upload cost and ongoing state rent, and it creeps
-      # up quietly — a dependency adding a few KB is invisible until someone
-      # looks. Printing it on every run (and into the step summary, so it shows
-      # on the PR without opening the logs) makes that drift visible.
-      # The limit lives in scripts/check-wasm-size.sh, which this step calls —
-      # the same script `make ci` runs — so there is exactly one copy of it.
       - name: Report wasm size
         run: ./scripts/check-wasm-size.sh

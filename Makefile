@@ -1,4 +1,4 @@
-.PHONY: build optimize test fmt lint clean deploy check-docs
+.PHONY: build optimize test fmt lint clean deploy check-docs check-msrv interface deny
 .PHONY: build optimize test fmt lint clean deploy ci
 
 # Build all contracts to wasm (requires the Stellar CLI).
@@ -59,3 +59,15 @@ ci:
 	cargo test --locked
 	cargo build --locked --target wasm32-unknown-unknown --release
 	./scripts/check-wasm-size.sh
+
+# Regenerate the committed public interface snapshot (#134).
+interface:
+	./scripts/update-interface.sh
+
+# Fail when rust-toolchain.toml and workspace rust-version disagree (#133).
+check-msrv:
+	./scripts/check-msrv.sh
+
+# Dependency advisory / license / ban audit (#132).
+deny:
+	cargo deny check
