@@ -88,17 +88,21 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
+      - name: Build wasm
+        run: cargo build --locked --target wasm32-unknown-unknown --release
       # Build the artifact deployments actually ship (#131): stellar contract
       # build targets wasm32v1-none and produces the same layout as
       # scripts/deploy.sh. The size check then measures that file.

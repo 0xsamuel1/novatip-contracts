@@ -19,7 +19,13 @@ set -euo pipefail
 require_env NETWORK SOURCE ADMIN USDC_TOKEN
 
 echo "==> Building contracts"
-stellar contract build
+REPO="github:Novatip/novatip-contracts"
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+DIRTY=""
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then DIRTY="-dirty"; fi
+stellar contract build \
+  --meta source_repo="${REPO}" \
+  --meta source_commit="${COMMIT}${DIRTY}"
 
 # The Stellar CLI moved its wasm target from wasm32-unknown-unknown to
 # wasm32v1-none, so the output path differs by CLI version. Locate the artifact
