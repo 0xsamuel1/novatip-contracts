@@ -9,25 +9,28 @@ set -euo pipefail
 #
 # Usage: ./scripts/check-wasm-size.sh [path/to/tip_splitter.wasm]
 
-# Hard ceiling for the unoptimized release wasm, in bytes.
+# Hard ceiling for the artifact `stellar contract build` produces — the same
+# wasm the deploy script ships (#131). Optimized builds land near ~15 KiB, so
+# 24 KiB leaves ~1.5x headroom for ordinary feature work; a real regression
+# (heavyweight dep, profile misconfig) still trips it.
 #
-# The contract builds to roughly 18 KiB today, so 64 KiB leaves well
-# over 3x headroom: ordinary feature work and a new dependency or two
-# will not trip it, and only a genuine regression — a heavyweight dep
-# pulled in by accident, or `opt-level`/`lto` silently dropping out of
-# the release profile — pushes the artifact past it.
-#
-# This measures the raw `cargo build` output, not the `stellar
-# contract optimize` artifact that actually gets uploaded, so it is a
-# deliberately loose upper bound rather than a cost estimate. If
-# optimization moves into CI, point the check at the optimized file
-# and lower this number to match.
-#
-# Raising it is fine when the growth is understood and intentional —
-# the point is that the bump shows up in a diff and gets a reason.
-MAX_WASM_BYTES="${MAX_WASM_BYTES:-65536}"
+# Raising it is fine when the growth is understood and intentional — the point
+# is that the bump shows up in a diff and gets a reason.
+MAX_WASM_BYTES="${MAX_WASM_BYTES:-24576}"
 
-WASM="${1:-target/wasm32-unknown-unknown/release/tip_splitter.wasm}"
+# Prefer the stellar-contract-build artifact (wasm32v1-none). Fall back to a
+# path argument for local use.
+WASM="${1:-}"
+if [ -z "$WASM" ]; then
+  for candidate in \
+    target/wasm32v1-none/release/tip_splitter.wasm \
+    target/wasm32v1-none/release/tip_splitter.optimized.wasm \
+    target/wasm32-unknown-unknown/release/tip_splitter.wasm
+  do
+    if [ -f "$candidate" ]; then WASM="$candidate"; break; fi
+  done
+fi
+WASM="${WASM:-target/wasm32v1-none/release/tip_splitter.wasm}"
 if [ ! -f "$WASM" ]; then
   echo "error: expected wasm at $WASM but it was not built" >&2
   exit 1
