@@ -19,8 +19,8 @@
 //! are ever registered.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, BytesN, Env, String, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
+    symbol_short, token, Address, BytesN, Env, IntoVal, String, Val, Vec,
 };
 
 /// 100% expressed in basis points.
@@ -101,7 +101,7 @@ const JAR_TTL_THRESHOLD: u32 = 500_000;
 ///
 /// This is a per-contract number for client feature detection. It complements
 /// the per-event schema version proposed in #83 rather than replacing it.
-const INTERFACE_VERSION: u32 = 1;
+const INTERFACE_VERSION: u32 = 2;
 
 /// One recipient and the share of every tip they receive, in basis points.
 #[contracttype]
@@ -186,16 +186,18 @@ pub struct Limits {
 
 /// A supporter's standing intention to tip a jar on a schedule.
 ///
-/// This is the on-chain *record* of a recurring tip, not a payment rail. A
-/// worker (or the supporter's client) reads `next_due_ledger` to decide when a
-/// payment is owed and calls `tip` then; collecting automatically would require
-/// the supporter to have approved the contract as a token spender, which is a
-/// separate concern held out of this issue on purpose so the storage model can
-/// be reviewed on its own.
+/// This is the on-chain *record* of a recurring tip plus the rail that makes it
+/// collectable. The supporter approves this contract as a spender for at least
+/// `amount` per payment; any keeper may then call [`TipSplitter::collect_recurring`]
+/// once the entry's `next_due_ledger` is reached, and the payment splits
+/// identically to a manual `tip` of the same amount. The supporter keeps full
+/// control: revoking the allowance (or `cancel_recurring`) stops collections
+/// dead, and every collection is capped by the allowance the supporter granted.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Recurring {
-    /// The supporter who registered the schedule and may cancel it.
+    /// The supporter who registered the schedule, funds each collection from
+    /// their own allowance, and may cancel it.
     pub supporter: Address,
     /// The jar every payment is routed to.
     pub jar_id: String,
@@ -247,6 +249,13 @@ pub enum DataKey {
     /// number. Held in instance storage: one `u64`, incremented once per tip,
     /// independent of how many jars exist.
     TipCount,
+    /// Optional post-tip hook contract, set and cleared by the admin (#176).
+    /// Instance storage, like the other configuration keys beside it.
+    TipHook,
+    /// Optional registrar contract whose co-signature `create_jar` requires
+    /// while it is set (#178). Instance storage; absence means jar creation
+    /// stays exactly as it was: owner auth only.
+    Registrar,
 }
 
 #[contracterror]
@@ -283,19 +292,45 @@ pub enum Error {
     /// `tip_in_token` was given a token the admin has not put on the
     /// allowlist. Checked before any transfer, so a rejection never moves
     /// funds.
-    TokenNotAllowed = 14,
+    TokenNotAllowed = 19,
     /// `disallow_token` was given the deploy-time default token. `tip` always
     /// pays through that address, so removing it would leave a working `tip`
-    /// path for a token the allowlist view reports as closed.
-    CannotDisallowDefault = 15,
+    /// path for a token the allowlist reports as closed.
+    CannotDisallowDefault = 20,
     /// The running tip totals would not fit their fields. Unreachable in
     /// practice — `u64` tip counts and `i128` sums cannot realistically be
     /// exhausted by tips under `MAX_RECIPIENTS` — but the counters are bumped
     /// with checked arithmetic so the failure is typed rather than an opaque
     /// wasm trap, per #167.
-    StatsOverflow = 16,
-    /// Tip amount exceeds the sender's USDC balance.
-    InsufficientBalance = 14,
+    StatsOverflow = 21,
+    /// Tip amount exceeds the sender's token balance. Checked before any
+    /// transfer so a rejection is a typed error, not a partial payout.
+    InsufficientBalance = 22,
+    /// `collect_recurring` was called before the schedule's next due ledger.
+    /// The entry is left untouched — an early call is a typed no-op, not a
+    /// cancellation.
+    NotDue = 23,
+    /// `collect_recurring` found the supporter's allowance for this contract
+    /// too small to cover the scheduled amount. Checked before any transfer.
+    InsufficientAllowance = 24,
+}
+
+/// The interface a post-tip hook contract must implement (#176).
+///
+/// `tip`/`tip_in_token`/`collect_recurring` call `on_tip` through
+/// `env.try_invoke_contract` *after* every payout and the `tip` event have
+/// been finalised, so a hook that panics cannot revert a successful tip: the
+/// panic is caught and discarded and the tip still settles. One caveat is
+/// inherent to the Soroban budget: if the hook burns the transaction's
+/// remaining instructions, the host aborts the whole footprint and the tip
+/// fails too — `try_invoke_contract` can catch a `panic!`, not an
+/// out-of-gas. Hooks are therefore opt-in, admin-controlled integrations, and
+/// an operator should point the hook at a contract they have audited.
+#[contractclient(name = "TipHookClient")]
+pub trait TipHook {
+    /// Called after a tip of `amount` into `jar_id` from `from` has been paid
+    /// and announced. Return value is ignored; authorisation is not requested.
+    fn on_tip(env: Env, jar_id: String, from: Address, amount: i128);
 }
 
 #[contract]
@@ -373,6 +408,12 @@ impl TipSplitter {
     /// Register a new tip jar. `owner` must authorize. `jar_id` must be
     /// non-empty and at most `MAX_JAR_ID_LEN` bytes. Splits must sum to 100%
     /// and may not name the same recipient twice.
+    ///
+    /// When the admin has named a registrar (#178), creating a jar
+    /// additionally requires that contract to co-sign the exact
+    /// `(jar_id, owner)` pair being registered — see [`TipSplitter::set_registrar`]
+    /// for what that gate is for and what it deliberately does not promise.
+    ///
     /// Emits a `jar_crtd` event so indexers can discover all jars from the
     /// event log without any on-chain list.
     pub fn create_jar(env: Env, owner: Address, jar_id: String, splits: Vec<Split>) {
@@ -385,6 +426,11 @@ impl TipSplitter {
             panic_with_error!(&env, Error::JarExists);
         }
         Self::validate_splits(&env, &splits);
+        // Runs after the validation above: a malformed request never burns a
+        // co-signature, and the args co-signed are exactly the values stored.
+        if let Some(registrar) = Self::get_registrar(env.clone()) {
+            registrar.require_auth_for_args((jar_id.clone(), owner.clone()).into_val(&env));
+        }
         env.storage().persistent().set(
             &key,
             &Jar {
@@ -703,22 +749,8 @@ impl TipSplitter {
             .publish((symbol_short!("min_tip"), jar_id), min_amount);
     }
 
-    /// Send a tip. Moves `amount` of USDC out of `from` and routes it across
-    /// the jar's recipients, then emits a `("tip", jar_id)` event carrying the
-    /// sender, the total, the message, and the per-recipient breakdown in split
-    /// order.
     /// Send a tip of `amount` of the deploy-time default token from `from`,
-    /// split across the jar's recipients atomically.
-    ///
-    /// Emits a `("tip", jar_id)` event carrying the sender, the total, the
-    /// message, the per-recipient breakdown in split order, and the token paid
-    /// in. Equivalent to `tip_in_token` with `get_token()`, and keeps the
-    /// jar's minimum tip enforced, since the token here is the one the minimum
-    /// was set in.
-    /// Send a tip. Transfers `amount` of USDC from `from`, split across the jar's
-    /// recipients atomically, then emits a `("tip", jar_id)` event carrying the
-    /// sender, the total, the message, the per-recipient breakdown in split
-    /// order, this tip's sequence number, and an absent reference.
+    /// split across the jar's recipients, and emit a `("tip", jar_id)` event.
     ///
     /// A recipient who cannot receive the token no longer reverts the whole tip:
     /// their share is escrowed in the contract (credit under `DataKey::Held`)
@@ -730,7 +762,7 @@ impl TipSplitter {
     ///
     /// Returns the tip's sequence number, so the supporter's own client learns
     /// which tip it just sent without waiting for the event log. See
-    /// [`tip_with_ref`] for attaching a client reference, and
+    /// [`Self::tip_with_ref`] for attaching a client reference, and
     /// [`Self::get_tip_count`] to read the running total.
     pub fn tip(env: Env, from: Address, jar_id: String, amount: i128, message: String) -> u64 {
         Self::tip_inner(env, from, jar_id, amount, message, None)
@@ -783,7 +815,16 @@ impl TipSplitter {
             .instance()
             .get(&DataKey::Token)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        Self::settle_tip(&env, &from, &jar_id, amount, &message, &token_addr, true);
+        Self::settle_tip(
+            &env,
+            &from,
+            &jar_id,
+            amount,
+            &message,
+            &token_addr,
+            true,
+            reference,
+        )
     }
 
     /// Send a tip of `amount` of `token`, for any token the admin has put on
@@ -808,6 +849,9 @@ impl TipSplitter {
     /// `compute_shares` needs no equivalent decision: it splits by basis points
     /// and never interprets the magnitude, so the same arithmetic is correct
     /// for any asset.
+    ///
+    /// Returns the tip's sequence number, exactly like [`Self::tip`]; the token
+    /// the tip was paid in is carried in the `tip` event itself.
     pub fn tip_in_token(
         env: Env,
         from: Address,
@@ -815,7 +859,7 @@ impl TipSplitter {
         token: Address,
         amount: i128,
         message: String,
-    ) {
+    ) -> u64 {
         from.require_auth();
         if !env
             .storage()
@@ -837,11 +881,13 @@ impl TipSplitter {
             &message,
             &token,
             token == default,
-        );
+            None,
+        )
     }
 
-    /// The body both tip entry points share: validate, split atomically, bump
-    /// the running totals, and emit the `tip` event.
+    /// The body every tip entry point shares: validate, split, transfer, bump
+    /// the running totals, assign the sequence number, and emit the `tip`
+    /// event.
     ///
     /// `from` must already have authorized. `enforce_min` says whether this
     /// call is in the token the jar's minimum tip is denominated in.
@@ -850,6 +896,10 @@ impl TipSplitter {
     /// instance a sender with an insufficient balance) reverts the whole call,
     /// so the counters never record a tip that did not settle — which is what
     /// makes them usable as an authoritative check on the indexer.
+    ///
+    /// The per-recipient amounts transferred here and the ones
+    /// [`Self::preview_tip`] reports for the same sender come from one helper,
+    /// [`Self::payout_amounts`], so the two can never drift apart (#177).
     #[allow(clippy::too_many_arguments)]
     fn settle_tip(
         env: &Env,
@@ -859,7 +909,8 @@ impl TipSplitter {
         message: &String,
         token_addr: &Address,
         enforce_min: bool,
-    ) {
+        reference: Option<BytesN<32>>,
+    ) -> u64 {
         if amount <= 0 {
             panic_with_error!(env, Error::InvalidAmount);
         }
@@ -893,30 +944,23 @@ impl TipSplitter {
             .persistent()
             .extend_ttl(&jar_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
 
-        let token_addr: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let client = token::Client::new(&env, &token_addr);
-        let contract_addr = env.current_contract_address();
         let client = token::Client::new(env, token_addr);
-
-        let n = jar.splits.len();
-        // One shared calculation with `preview_split`, so the number a client
-        // shows before signing is the number paid out here.
-        let shares = Self::compute_shares(env, &jar.splits, amount);
+        let contract_addr = env.current_contract_address();
 
         // Fail fast with the contract's own code when the sender cannot cover
         // the full tip. Without this, the token's transfer failure propagates
         // with the SAC's own number (10/11/13), which collides with ours —
         // an empty wallet would surface as `SplitsEmpty`. Checked once, before
         // any transfer, so a failed tip never moves partial funds.
-        if client.balance(&from) < amount {
-            panic_with_error!(&env, Error::InsufficientBalance);
+        if client.balance(from) < amount {
+            panic_with_error!(env, Error::InsufficientBalance);
         }
 
-        let mut skipped: i128 = 0;
+        let n = jar.splits.len();
+        // One shared calculation with `preview_split` and `preview_tip`, so the
+        // number a client shows before signing is the number paid out here.
+        let plan = Self::payout_amounts(env, &jar.splits, from, amount);
+
         // The per-recipient breakdown published in the `tip` event, in split
         // order. Each entry is `(recipient, moved, held)`: `moved` is what left
         // the tipper for that recipient this call (0 for a self-transfer that
@@ -926,74 +970,44 @@ impl TipSplitter {
         // self-describing: an indexer that recomputed the split arithmetic from
         // `get_jar` could get a different answer, because the jar's splits may
         // have changed between the tip and the read.
-        let mut breakdown: Vec<(Address, i128, bool)> = Vec::new(&env);
-        // order. Recording it as the transfers happen is what makes the event
-        // self-describing: an indexer that recomputed the split arithmetic
-        // from `get_jar` could get a different answer, because the jar's
-        // splits may have changed between the tip and the read.
-        let mut breakdown: Vec<(Address, i128)> = Vec::new(env);
+        let mut breakdown: Vec<(Address, i128, bool)> = Vec::new(env);
         for i in 0..n {
             let split = jar.splits.get(i).unwrap();
-            let mut share = shares.get(i).unwrap();
-            if i == n - 1 {
-                // A share withheld from a self-transfer above was never sent,
-                // so it stays with the tipper by rolling into the last
-                // recipient's remainder — exactly as it did when this loop
-                // accumulated only the amounts it actually transferred.
-                share += skipped;
-            }
-            if share > 0 && split.to != from {
-                // Skip self-transfers: a tipper who is also a recipient would
-                // otherwise pay themselves with a no-op transfer that burns gas
-                // and emits a confusing token event.
-                let delivered = matches!(client.try_transfer(&from, &split.to, &share), Ok(Ok(_)));
-                if delivered {
-                    breakdown.push_back((split.to, share, false));
-                } else {
-                    // The recipient cannot receive the token (dropped trustline,
-                    // deauthorised account). Hold their share in the contract
-                    // so one collaborator's account state no longer reverts the
-                    // whole tip: the funds leave the tipper exactly as if the
-                    // transfer had succeeded, and `withdraw_held` pays them once
-                    // the recipient can receive again (#171).
-                    client.transfer(&from, &contract_addr, &share);
-                    let held_key = DataKey::Held(split.to.clone());
-                    let held: i128 = env.storage().persistent().get(&held_key).unwrap_or(0);
-                    env.storage().persistent().set(&held_key, &(held + share));
-                    env.storage().persistent().extend_ttl(
-                        &held_key,
-                        JAR_TTL_THRESHOLD,
-                        JAR_TTL_LEDGERS,
-                    );
-                    breakdown.push_back((split.to, share, true));
-                }
-            let paid = if share > 0 && split.to != *from {
-                // Skip self-transfers: a tipper who is also a recipient would
-                // otherwise pay themselves with a no-op transfer that burns gas
-                // and emits a confusing token event.
-                client.transfer(from, &split.to, &share);
-                share
-            } else {
-                skipped += share;
-                // Nothing moved, so the breakdown reports 0 rather than the
-                // notional share. The event is a record of the transfers this
-                // call actually made, which is what a balance-tracking indexer
-                // needs to stay in step with the ledger.
+            let share = plan.get(i).unwrap();
+            if share == 0 {
+                // Nothing moved (the recipient is the tipper), so the breakdown
+                // reports 0 rather than the notional share. The event is a
+                // record of the transfers this call actually made, which is
+                // what a balance-tracking indexer needs to stay in step with
+                // the ledger.
                 breakdown.push_back((split.to, 0, false));
+                continue;
+            }
+            let delivered = matches!(client.try_transfer(from, &split.to, &share), Ok(Ok(_)));
+            if delivered {
+                breakdown.push_back((split.to, share, false));
+            } else {
+                // The recipient cannot receive the token (dropped trustline,
+                // deauthorised account). Hold their share in the contract so
+                // one collaborator's account state no longer reverts the whole
+                // tip: the funds leave the tipper exactly as if the transfer
+                // had succeeded, and `withdraw_held` pays them once the
+                // recipient can receive again (#171).
+                client.transfer(from, &contract_addr, &share);
+                let held_key = DataKey::Held(split.to.clone());
+                let held: i128 = env.storage().persistent().get(&held_key).unwrap_or(0);
+                env.storage().persistent().set(&held_key, &(held + share));
+                env.storage().persistent().extend_ttl(
+                    &held_key,
+                    JAR_TTL_THRESHOLD,
+                    JAR_TTL_LEDGERS,
+                );
+                breakdown.push_back((split.to, share, true));
             }
         }
 
         Self::bump_totals(env, jar_id, from, amount);
 
-        env.events().publish(
-            (symbol_short!("tip"), jar_id.clone()),
-            (
-                from.clone(),
-                amount,
-                message.clone(),
-                breakdown,
-                token_addr.clone(),
-            ),
         // Assign the sequence number only now that every transfer has
         // succeeded. Soroban rolls the whole transaction back on a panic, so a
         // reverted tip consumes no storage either; incrementing after the loop
@@ -1011,18 +1025,132 @@ impl TipSplitter {
             + 1;
         env.storage().instance().set(&DataKey::TipCount, &seq);
 
-        // The sequence number and the reference are appended after the four
-        // elements `decodeTipEvent` already reads, in this fixed order, so a
-        // positional decoder keeps working and the new fields occupy documented
-        // slots. Neither joins the topics: the SDK's `tipTopicFilter` asserts
-        // one segment per published topic, so a third topic would make its
-        // existing two-segment filter match nothing.
+        // The token, the sequence number and the reference are appended after
+        // the four elements `decodeTipEvent` originally read, in this fixed
+        // order, so a positional decoder keeps working and the new fields
+        // occupy documented slots. None joins the topics: the SDK's
+        // `tipTopicFilter` asserts one segment per published topic, so a third
+        // topic would make its existing two-segment filter match nothing.
         env.events().publish(
-            (symbol_short!("tip"), jar_id),
-            (from, amount, message, breakdown, seq, reference),
+            (symbol_short!("tip"), jar_id.clone()),
+            (
+                from.clone(),
+                amount,
+                message.clone(),
+                breakdown,
+                token_addr.clone(),
+                seq,
+                reference,
+            ),
         );
 
+        // Post-tip hook (#176): only now, after the funds and the event are
+        // finalised, so a hook can never observe — or prevent — a tip that did
+        // not settle.
+        Self::call_tip_hook(env, jar_id, from, amount);
+
         seq
+    }
+
+    /// Register or clear the post-tip hook contract (#176). Admin-only.
+    ///
+    /// When set, every settled tip — `tip`, `tip_with_ref`, `tip_in_token` and
+    /// `collect_recurring` — calls `on_tip(jar_id, from, amount)` on `hook`
+    /// *after* the transfers and the `tip` event, through
+    /// `env.try_invoke_contract`, so a hook that panics or errors cannot revert
+    /// the tip: the failure is caught and discarded. The caveat that cannot be
+    /// engineered away is the transaction budget: a hook that exhausts it
+    /// aborts the whole transaction, tip included — `try_invoke_contract`
+    /// catches a contract error, not an out-of-gas. See `docs/CONTRACT.md`.
+    ///
+    /// Passing `None` clears the hook and restores the pre-hook behaviour
+    /// exactly. Every change emits a `tip_hook` event carrying the admin, so
+    /// the configuration change is attributable in the event log.
+    pub fn set_tip_hook(env: Env, hook: Option<Address>) {
+        let admin = Self::require_admin(&env);
+        match &hook {
+            Some(h) => {
+                env.storage().instance().set(&DataKey::TipHook, h);
+            }
+            None => {
+                env.storage().instance().remove(&DataKey::TipHook);
+            }
+        }
+        env.events()
+            .publish((symbol_short!("tip_hook"), admin), hook);
+    }
+
+    /// The currently registered post-tip hook, or `None` when tips settle
+    /// without one (#176).
+    pub fn get_tip_hook(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TipHook)
+    }
+
+    /// Fire the post-tip hook if one is registered (#176).
+    ///
+    /// Deliberately last in every settle path, and deliberately result-blind:
+    /// whatever the hook does to its own state, the tip has already moved the
+    /// funds and published its event. A failed invocation is discarded rather
+    /// than propagated — the whole point is that a broken badge contract cannot
+    /// stop a creator being paid.
+    fn call_tip_hook(env: &Env, jar_id: &String, from: &Address, amount: i128) {
+        let Some(hook): Option<Address> = env.storage().instance().get(&DataKey::TipHook) else {
+            return;
+        };
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(jar_id.clone().into_val(env));
+        args.push_back(from.clone().into_val(env));
+        args.push_back(amount.into_val(env));
+        let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &hook,
+            &symbol_short!("on_tip"),
+            args,
+        );
+    }
+
+    /// Set or clear the registrar whose co-signature `create_jar` requires
+    /// (#178). Admin-only.
+    ///
+    /// Why: Novatip derives a jar's on-chain id from the claimed slug
+    /// (`@alice` for `/alice`) and the backend guarantees uniqueness in *its*
+    /// database, but the chain does not know about the claim — until Alice's
+    /// onboarding finishes, anyone can call `create_jar("@alice", ...)` and
+    /// strand her behind an "already registered on-chain" error. While a
+    /// registrar is set, a slug can only be created for the owner the registrar
+    /// approved: the backend signs the authorisation entry when a slug claim
+    /// succeeds, and the creator's wallet submits the transaction as today.
+    ///
+    /// The trust model is deliberately narrow, and it is *not* solved here by
+    /// code: the registrar is the same backend, so this gate is only as
+    /// trustworthy as the backend's key management — it prevents race-style
+    /// squatting by outsiders, while a compromised registrar key could register
+    /// slugs for anyone (though *only* ones not yet registered; existing jars
+    /// are untouched). The backend holding no keys by design is the open
+    /// question #178 flags; this entry point makes the mechanism available and
+    /// reversible — `None` restores today's permissionless behaviour exactly,
+    /// so existing deployments and third-party users are unaffected until the
+    /// admin opts in.
+    ///
+    /// Emits a `reg_set` event carrying the admin who made the change, so the
+    /// gate's state is attributable in the event log.
+    pub fn set_registrar(env: Env, registrar: Option<Address>) {
+        let admin = Self::require_admin(&env);
+        match &registrar {
+            Some(r) => {
+                env.storage().instance().set(&DataKey::Registrar, r);
+            }
+            None => {
+                env.storage().instance().remove(&DataKey::Registrar);
+            }
+        }
+        env.events()
+            .publish((symbol_short!("reg_set"), admin), registrar);
+    }
+
+    /// The registrar whose co-signature `create_jar` currently requires, or
+    /// `None` when jar creation is permissionless as before (#178).
+    pub fn get_registrar(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Registrar)
     }
 
     /// The number of tips this contract has taken, and the sequence number the
@@ -1156,11 +1284,13 @@ impl TipSplitter {
 
     /// Register a recurring tip to a jar (#174), authorized by the supporter.
     ///
-    /// This stores the on-chain *record* only — it moves no funds. A payment is
-    /// still a normal `tip`, triggered when the schedule comes due; automatic
-    /// collection depends on the supporter having separately approved the
-    /// contract as a token spender, which is deliberately a different concern so
-    /// this storage model can be reviewed on its own.
+    /// This stores the on-chain schedule; it moves no funds itself. The
+    /// payment rail is [`Self::collect_recurring`] (#175): the supporter
+    /// approves this contract as a token spender (`approve` with
+    /// `spender = tip_splitter`, at least `amount` per period) and any keeper
+    /// collects once `next_due_ledger` is reached. Revoking the allowance — or
+    /// `cancel_recurring` — stops collections dead, so the supporter never
+    /// loses control of the money.
     ///
     /// Validated against the same checks `tip` applies so a stored schedule can
     /// actually be paid: the jar must exist, `amount` must be positive and pass
@@ -1272,6 +1402,180 @@ impl TipSplitter {
         entry
     }
 
+    /// Collect one due payment of a recurring tip (#175). Callable by anyone —
+    /// typically the keeper (the backend or the creator) — with **no**
+    /// authorisation from the supporter.
+    ///
+    /// The payment rail is the token allowance the supporter granted this
+    /// contract (`approve` on the token with `spender = tip_splitter`, at least
+    /// `amount` per period). Each recipient's share is moved with
+    /// `transfer_from` with the contract itself as spender, split by the same
+    /// [`Self::payout_amounts`] arithmetic as a manual `tip` — including the
+    /// tipper-is-recipient skip, the dust roll-in, and the held-escrow fallback
+    /// (#171). The `tip` event is published in the identical shape with the
+    /// supporter as `from` and an absent reference, so the indexer, webhooks
+    /// and analytics pick a collected tip up exactly like a manual one. The
+    /// jar and supporter stats are bumped as well.
+    ///
+    /// Rules, per the issue:
+    /// - A call before `next_due_ledger` fails with `NotDue` and changes
+    ///   nothing; the entry is *not* cancelled, so the same call succeeds once
+    ///   the ledger is reached.
+    /// - At most **one period is collected per call**, and `next_due_ledger`
+    ///   advances by exactly `period_ledgers` each time: a keeper that was
+    ///   offline for months cannot drain months at once, and the schedule keeps
+    ///   its original cadence anchor.
+    /// - An exhausted or expired allowance fails with the typed
+    ///   `InsufficientAllowance` before any funds move (an expired allowance
+    ///   reads as zero); a supporter whose balance cannot cover the period
+    ///   fails with the typed `InsufficientBalance`. Both checks run before
+    ///   any transfer, so a rejected collection changes nothing.
+    /// - The per-jar minimum tip is *not* re-enforced here: it was enforced at
+    ///   registration, and a minimum raised later must not silently strand
+    ///   already-registered schedules. A supporter who wants the new floor
+    ///   honoured cancels and re-registers.
+    ///
+    /// Reverts (leaving state untouched) with `RecurringNotFound` for an
+    /// unknown id and `JarNotFound` if the jar's entry was archived. Emits the
+    /// `tip` event and fires the post-tip hook (#176) like any settled tip.
+    pub fn collect_recurring(env: Env, id: u128) {
+        let rec_key = DataKey::Recurring(id);
+        let entry: Recurring = env
+            .storage()
+            .persistent()
+            .get(&rec_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::RecurringNotFound));
+
+        // Due check first: an early call is a typed no-op, no funds move, no
+        // TTL bump that would mask the rejection.
+        if env.ledger().sequence() < entry.next_due_ledger {
+            panic_with_error!(&env, Error::NotDue);
+        }
+
+        let jar_key = DataKey::Jar(entry.jar_id.clone());
+        let jar: Jar = env
+            .storage()
+            .persistent()
+            .get(&jar_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+
+        // A recurring schedule is a promise about the *default* token: it was
+        // registered against `tip`'s token and minimum, and it is collected
+        // with the contract's own allowance, which is per-asset.
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let client = token::Client::new(&env, &token_addr);
+        let contract_addr = env.current_contract_address();
+
+        // Allowance gate, checked before any transfer so an exhausted or
+        // expired allowance is this contract's typed error rather than the
+        // token's own: the supporter approves at least one period's `amount`,
+        // and the transfers below consume at most `amount` in total (the plan
+        // never moves more than the tip). An expired allowance reads as 0 and
+        // fails the same check.
+        if client.allowance(&entry.supporter, &contract_addr) < entry.amount {
+            panic_with_error!(&env, Error::InsufficientAllowance);
+        }
+
+        // Same fail-fast rationale as `settle_tip`: an empty supporter wallet
+        // must surface as this contract's typed `InsufficientBalance`, not the
+        // SAC's own code, and the check runs before any transfer so a rejected
+        // collection moves nothing.
+        if client.balance(&entry.supporter) < entry.amount {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
+
+        env.storage()
+            .persistent()
+            .extend_ttl(&jar_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+
+        // The same split a manual tip of this amount from this supporter would
+        // produce — one shared helper, so collection can never drift from the
+        // preview or the tip (#177).
+        let plan = Self::payout_amounts(&env, &jar.splits, &entry.supporter, entry.amount);
+
+        let mut breakdown: Vec<(Address, i128, bool)> = Vec::new(&env);
+        for i in 0..jar.splits.len() {
+            let split = jar.splits.get(i).unwrap();
+            let share = plan.get(i).unwrap();
+            if share == 0 {
+                // The supporter is this recipient; the share stays with them
+                // exactly as a manual tip would leave it.
+                breakdown.push_back((split.to, 0, false));
+                continue;
+            }
+            let delivered = matches!(
+                client.try_transfer_from(&contract_addr, &entry.supporter, &split.to, &share),
+                Ok(Ok(_))
+            );
+            if delivered {
+                breakdown.push_back((split.to, share, false));
+            } else {
+                // Same escrow fallback as `settle_tip` (#171): the allowance is
+                // still charged and the share waits in the contract for the
+                // recipient to become payable again.
+                client.transfer_from(&contract_addr, &entry.supporter, &contract_addr, &share);
+                let held_key = DataKey::Held(split.to.clone());
+                let held: i128 = env.storage().persistent().get(&held_key).unwrap_or(0);
+                env.storage().persistent().set(&held_key, &(held + share));
+                env.storage().persistent().extend_ttl(
+                    &held_key,
+                    JAR_TTL_THRESHOLD,
+                    JAR_TTL_LEDGERS,
+                );
+                breakdown.push_back((split.to, share, true));
+            }
+        }
+
+        // Advance by exactly one period, anchored on the old due ledger rather
+        // than on "now plus period": a late keeper collects this period and the
+        // next becomes due one period after the schedule said, never later.
+        let next_due_ledger = entry
+            .next_due_ledger
+            .checked_add(entry.period_ledgers)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidPeriod));
+        env.storage().persistent().set(
+            &rec_key,
+            &Recurring {
+                next_due_ledger,
+                ..entry.clone()
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&rec_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+
+        Self::bump_totals(&env, &entry.jar_id, &entry.supporter, entry.amount);
+
+        let seq: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TipCount)
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().instance().set(&DataKey::TipCount, &seq);
+
+        // Identical positional shape to `settle_tip`'s event; the collected
+        // payment carries no client reference, published as an explicit `None`.
+        env.events().publish(
+            (symbol_short!("tip"), entry.jar_id.clone()),
+            (
+                entry.supporter.clone(),
+                entry.amount,
+                entry.message.clone(),
+                breakdown,
+                token_addr.clone(),
+                seq,
+                Option::<BytesN<32>>::None,
+            ),
+        );
+
+        Self::call_tip_hook(&env, &entry.jar_id, &entry.supporter, entry.amount);
+    }
+
     /// Read a jar's configuration.
     pub fn get_jar(env: Env, jar_id: String) -> Jar {
         let key = DataKey::Jar(jar_id);
@@ -1354,8 +1658,9 @@ impl TipSplitter {
     /// One caveat: `tip` withholds a recipient's share when that recipient is
     /// the tipper, rather than making them pay themselves. This view does not
     /// know who is tipping, so it reports every recipient's full share. A
-    /// client whose connected wallet appears in the splits should account for
-    /// that itself.
+    /// client whose connected wallet appears in the splits should use
+    /// [`Self::preview_tip`] instead, which takes the sender and matches the
+    /// actual payout (#177).
     pub fn preview_split(env: Env, jar_id: String, amount: i128) -> Vec<i128> {
         let key = DataKey::Jar(jar_id.clone());
         let jar: Jar = env
@@ -1378,6 +1683,61 @@ impl TipSplitter {
         }
 
         Self::compute_shares(&env, &jar.splits, amount)
+    }
+
+    /// What each recipient would *actually receive* from a `tip` of `amount`
+    /// sent by `from`, in split order — the sender-aware version of
+    /// [`Self::preview_split`] (#177).
+    ///
+    /// `preview_split` does not know who is tipping, and `tip` treats a
+    /// recipient who is also the sender differently: their share is not
+    /// transferred and the last recipient absorbs the dust. For a collaborator
+    /// tipping their own jar the two previews used to disagree, and the old
+    /// advice to "account for that itself" reintroduced exactly the duplicated
+    /// arithmetic `preview_split` exists to remove. This view closes the gap.
+    ///
+    /// The numbers are produced by the same private helper
+    /// ([`Self::payout_amounts`]) that `tip` itself uses to build its transfer
+    /// loop, so whatever the payout rule ends up being — including any change
+    /// from #66 — `tip` and this view follow it together. A recipient who is
+    /// the sender is reported as `0`, matching the `tip` event's breakdown
+    /// entry for them.
+    ///
+    /// Same validation as `preview_split`: rejects unknown jars (`JarNotFound`),
+    /// amounts below the jar's minimum (`BelowMinTipAmount`), and amounts
+    /// `tip` would reject in `compute_shares`. Like every view it reads no
+    /// balance, so it does *not* say whether `from` can actually pay; and a
+    /// share that ends up escrowed as `held` at transfer time (#171) is still
+    /// reported here, because the amount does leave the tipper either way —
+    /// the `tip` event's breakdown carries the `held` flag.
+    pub fn preview_tip(env: Env, jar_id: String, from: Address, amount: i128) -> Vec<i128> {
+        // Same precedence as `settle_tip`: an unusable amount is refused before
+        // the jar lookup, so a client gets the identical error from preview
+        // and from the tip itself.
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+        let key = DataKey::Jar(jar_id.clone());
+        let jar: Jar = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+
+        let min_key = DataKey::MinTip(jar_id);
+        if let Some(min_amount) = env.storage().persistent().get::<DataKey, i128>(&min_key) {
+            if amount < min_amount {
+                panic_with_error!(&env, Error::BelowMinTipAmount);
+            }
+            env.storage()
+                .persistent()
+                .extend_ttl(&min_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        }
+
+        Self::payout_amounts(&env, &jar.splits, &from, amount)
     }
 
     /// Read a jar's optional minimum tip amount.
@@ -1583,6 +1943,44 @@ impl TipSplitter {
             max_recipients: MAX_RECIPIENTS,
             max_message_len: MAX_MESSAGE_LEN,
         }
+    }
+
+    /// The amounts a settled tip of `amount` from `from` actually transfers,
+    /// one per recipient in split order (#177).
+    ///
+    /// This is `compute_shares` plus the two sender-dependent rules the old
+    /// `tip` loop carried inline: a recipient who *is* the sender is skipped
+    /// (reported as `0` — no self-transfer, the share stays with the tipper),
+    /// and every skipped share rolls into the final recipient's remainder, so
+    /// the positive entries still sum to `amount` whenever the sender is not
+    /// the last recipient. `settle_tip` pays exactly these numbers out and
+    /// [`Self::preview_tip`] reports them, which is what keeps a tip's event
+    /// breakdown and its preview from ever diverging; `collect_recurring`
+    /// builds its `transfer_from` plan from here too.
+    ///
+    /// Panics with the same errors as [`Self::compute_shares`] for amounts a
+    /// tip of this jar could not pay.
+    fn payout_amounts(env: &Env, splits: &Vec<Split>, from: &Address, amount: i128) -> Vec<i128> {
+        let shares = Self::compute_shares(env, splits, amount);
+        let n = splits.len();
+        let mut plan: Vec<i128> = Vec::new(env);
+        let mut skipped: i128 = 0;
+        for i in 0..n {
+            let split = splits.get(i).unwrap();
+            let mut share = shares.get(i).unwrap();
+            if i == n - 1 {
+                // A share withheld from a self-transfer above was never sent,
+                // so it rolls into the last recipient's remainder.
+                share += skipped;
+            }
+            if share > 0 && split.to != *from {
+                plan.push_back(share);
+            } else {
+                skipped += share;
+                plan.push_back(0);
+            }
+        }
+        plan
     }
 
     /// Split `amount` across `splits` in basis points, returning one share per
