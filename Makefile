@@ -1,3 +1,5 @@
+.PHONY: build optimize test fmt lint clean deploy check-docs
+.PHONY: build optimize test fmt lint clean deploy ci lint-scripts
 .PHONY: build optimize test fmt lint clean deploy check-docs check-msrv interface deny
 .PHONY: build optimize test fmt lint clean deploy ci
 
@@ -38,6 +40,10 @@ fmt:
 # Lint and fail on any warning (matches CI).
 lint:
 	cargo clippy --locked --all-targets -- -D warnings
+
+# Lint shell scripts with shellcheck (#125).
+lint-scripts:
+	shellcheck scripts/*.sh scripts/lib/*.sh
 
 # Remove build artifacts.
 clean:

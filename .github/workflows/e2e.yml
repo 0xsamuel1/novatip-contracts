@@ -1,0 +1,114 @@
+name: E2E Local Network
+
+# Runs the deploy, create-jar and tip flow against a local Stellar network
+# using the stellar/quickstart image (#126). Self-contained — no secrets, no
+# testnet dependency — so it can run on pull requests from forks.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'contracts/**'
+      - '.github/workflows/e2e.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      stellar:
+        image: stellar/quickstart:latest
+        ports:
+          - 8000:8000
+        options: >-
+          --health-cmd "curl -sf http://localhost:8000/health || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Stellar CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL -o stellar-cli.tar.gz \
+            "https://github.com/stellar/stellar-cli/releases/download/v22.0.0/stellar-cli-22.0.0-x86_64-unknown-linux-gnu.tar.gz"
+          tar xzf stellar-cli.tar.gz
+          install stellar /usr/local/bin/stellar
+          stellar --version
+
+      - name: Setup local identities
+        run: |
+          set -euo pipefail
+          stellar keys generate deployer --network local --fund
+          stellar keys generate creator --network local --fund
+          stellar keys generate recipient1 --network local
+          stellar keys generate recipient2 --network local
+
+      - name: Deploy a test token (stand-in for USDC)
+        run: |
+          set -euo pipefail
+          TOKEN_ID=$(stellar contract deploy \
+            --wasm "$(find ~/.local -name 'stellar_asset.wasm' | head -1)" \
+            --source deployer \
+            --network local \
+            -- \
+            --admin deployer)
+          echo "TOKEN_ID=${TOKEN_ID}" >> "$GITHUB_ENV"
+
+      - name: Deploy tip_splitter via deploy.sh
+        run: |
+          export NETWORK=local
+          export SOURCE=deployer
+          export ADMIN=$(stellar keys address deployer)
+          export USDC_TOKEN="${TOKEN_ID}"
+          ./scripts/deploy.sh
+
+      - name: Create multi-recipient jar via create-jar.sh
+        run: |
+          export NETWORK=local
+          export SOURCE=creator
+          export OWNER=$(stellar keys address creator)
+          export SLUG=testjar
+          export SPLITS='[{"to":"'$(stellar keys address recipient1)'","bps":6000},{"to":"'$(stellar keys address recipient2)'","bps":4000}]'
+          ./scripts/create-jar.sh
+
+      - name: Send tip via tip.sh
+        run: |
+          export NETWORK=local
+          export SOURCE=deployer
+          export JAR_ID=testjar
+          export AMOUNT=10000000
+          ./scripts/tip.sh
+
+      - name: Assert recipient balances
+        run: |
+          set -euo pipefail
+          BAL1=$(stellar contract invoke --id "${TOKEN_ID}" --source deployer --network local -- \
+            balance --id "$(stellar keys address recipient1)")
+          BAL2=$(stellar contract invoke --id "${TOKEN_ID}" --source deployer --network local -- \
+            balance --id "$(stellar keys address recipient2)")
+          echo "recipient1 balance: ${BAL1}"
+          echo "recipient2 balance: ${BAL2}"
+          # 60/40 split of 10000000 = 6000000 / 4000000
+          test "${BAL1}" = "6000000" || { echo "FAIL: recipient1 expected 6000000, got ${BAL1}"; exit 1; }
+          test "${BAL2}" = "4000000" || { echo "FAIL: recipient2 expected 4000000, got ${BAL2}"; exit 1; }
+
+      - name: Assert jar state via get_jar
+        run: |
+          set -euo pipefail
+          JAR=$(stellar contract invoke --id "$(cat .contract-id)" --source deployer --network local -- \
+            get_jar --jar_id testjar)
+          echo "jar: ${JAR}"
+          echo "${JAR}" | jq -e '.splits | length == 2' >/dev/null || { echo "FAIL: jar should have 2 splits"; exit 1; }
