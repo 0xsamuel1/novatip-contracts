@@ -9,6 +9,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Lint the shell scripts under scripts/ with shellcheck (#125). These are
+  # the deploy/bootstrap entry points — a quoting mistake or unset-variable
+  # bug here reaches main unnoticed and is found by whoever deploys next.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck
+        run: shellcheck scripts/*.sh scripts/lib/*.sh
+
   # The Stellar CLI does not ship with the plain-rust CI above, so this job
   # installs a pinned version — deliberately the release line matching the
   # soroban-sdk the contract builds against — and checks that

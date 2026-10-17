@@ -16,6 +16,12 @@ set -euo pipefail
 #              '[{"to":"G...A","bps":6000},{"to":"G...B","bps":4000}]'
 #              bps values must sum to 10000; at most 20 recipients
 #
+# Validation rules (enforced locally before the transaction, #124):
+#   - SLUG is 1–64 bytes
+#   - Each split entry: `to` is a non-empty string, `bps` is an integer 1..10000
+#   - No duplicate `to` addresses
+#   - bps values sum to 10000
+#
 # Usage:  ./scripts/create-jar.sh
 #         SPLITS='[{"to":"G...A","bps":7000},{"to":"G...B","bps":3000}]' \
 #           ./scripts/create-jar.sh
@@ -26,6 +32,13 @@ set -euo pipefail
 
 require_env NETWORK SOURCE OWNER SLUG
 CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+
+# Validate SLUG: 1–64 bytes (#124).
+SLUG_LEN=$(printf '%s' "${SLUG}" | wc -c)
+if [ "${SLUG_LEN}" -lt 1 ] || [ "${SLUG_LEN}" -gt 64 ]; then
+  echo "error: SLUG must be 1–64 bytes (got ${SLUG_LEN})" >&2
+  exit 1
+fi
 
 resolve_splits || exit 1
 
