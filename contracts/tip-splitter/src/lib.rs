@@ -1671,7 +1671,7 @@ impl TipSplitter {
                 panic_with_error!(env, Error::SplitOutOfRange);
             }
             // `checked_add` rather than `+=`: `bps` is caller-supplied, and an
-            // overflow must surface as the same typed `InvalidSplits` every
+            // overflow must surface as the same typed `SplitSumNot100Pct` every
             // other rejection returns, not as an opaque wasm trap. The bound
             // above already makes overflow unreachable, so this is belt and
             // braces — but it puts the invariant in the code rather than
