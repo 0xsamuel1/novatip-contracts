@@ -35,7 +35,7 @@ pub trait SplitterInterface {
     fn get_jar(env: Env, jar_id: String) -> Jar;
     fn preview_split(env: Env, jar_id: String, amount: i128) -> Vec<i128>;
     fn get_token(env: Env) -> Address;
-    fn tip(env: Env, from: Address, jar_id: String, amount: i128, message: String);
+    fn tip(env: Env, from: Address, jar_id: String, amount: i128, message: String) -> u64;
 }
 
 /// Mirror of `tip_splitter::Split`. The XDR is a map keyed by field names, so
@@ -53,6 +53,9 @@ pub struct Split {
 pub struct Jar {
     pub owner: Address,
     pub splits: Vec<Split>,
+    /// Lock flag added by #173; the XDR is a name-keyed map, so the mirror
+    /// must carry every field the real `Jar` stores.
+    pub locked: bool,
 }
 
 #[contracttype]
