@@ -50,3 +50,13 @@ tagged and deployed.
 
 Do not open a public issue. See
 [SECURITY.md](https://github.com/Novatip/novatip-docs/blob/main/SECURITY.md).
+
+## Local checks (match CI)
+
+| Check | Command |
+| ----- | ------- |
+| Format / lint / test | `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` |
+| MSRV pin sync (#133) | `make check-msrv` — `rust-toolchain.toml` `channel` and workspace `rust-version` must share major.minor. The crate inherits `rust-version.workspace = true`. |
+| Dependency audit (#132) | `cargo deny check` (`cargo install cargo-deny`) — advisories, licenses, bans. See `deny.toml`. |
+| Contract size (#131) | `make build && ./scripts/check-wasm-size.sh` — measures the `stellar contract build` artifact. |
+| Public interface (#134) | `make interface` to regenerate `contracts/tip-splitter/interface.json`, then `./scripts/check-interface.sh`. **When it changes:** regenerate, add a CHANGELOG entry, and never renumber existing `Error` variants — append only. |

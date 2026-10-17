@@ -1,10 +1,10 @@
 [package]
 name = "tip-splitter"
 version = "0.1.0"
-edition = "2021"
-# Must match the channel pinned in rust-toolchain.toml. Declaring it lets the
-# MSRV-aware resolver keep transitive deps off newer editions we can't parse.
-rust-version = "1.84"
+# Single source of truth: [workspace.package] in the root Cargo.toml,
+# kept in sync with rust-toolchain.toml by the CI check-msrv job (#133).
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [lib]
@@ -17,3 +17,6 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = { workspace = true }
+
+[features]
+wasm-test = []
