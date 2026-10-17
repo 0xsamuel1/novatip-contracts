@@ -69,14 +69,33 @@ on success and clearing a jar that already had no floor is a silent no-op.
 
 ## Network Deployments
 
-| Network | Contract ID | Status |
-|---------|-------------|--------|
-| Testnet | [`CCKPD2MPAYQYCL7QJKUMJHTEJWNHSIP7BZYIZBRO3C4DM4VHZKL6VBRL`](https://stellar.expert/explorer/testnet/contract/CCKPD2MPAYQYCL7QJKUMJHTEJWNHSIP7BZYIZBRO3C4DM4VHZKL6VBRL) | live |
-| Mainnet | coming soon | pending audit |
+| Network | Contract ID | Source Commit | Status |
+|---------|-------------|---------------|--------|
+| Testnet | [`CCKPD2MPAYQYCL7QJKUMJHTEJWNHSIP7BZYIZBRO3C4DM4VHZKL6VBRL`](https://stellar.expert/explorer/testnet/contract/CCKPD2MPAYQYCL7QJKUMJHTEJWNHSIP7BZYIZBRO3C4DM4VHZKL6VBRL) | pre-`main` (older interface) | live, behind `main` |
+| Mainnet | coming soon | — | pending audit |
 
-The testnet deployment settles in the testnet USDC SAC below, and carries a
-`@demo` jar splitting 70/30 between two accounts for anyone wanting to try the
-read methods without deploying their own.
+> **Testnet deployment is behind `main`.** The deployed contract exposes only
+> 9 of the 16 functions documented in [`docs/CONTRACT.md`](./docs/CONTRACT.md):
+> `__constructor`, `create_jar`, `update_splits`, `transfer_jar_ownership`,
+> `tip`, `get_jar`, `jar_exists`, `get_admin`, `get_token`.
+>
+> **Missing from the current testnet deployment:** `get_jar_owner`,
+> `get_split_count`, `preview_split`, `is_recipient`, `get_limits`,
+> `set_min_tip_amount`, `get_min_tip_amount`. Its `tip` and `jar_xfer` events
+> also predate the payload changes listed as breaking in the changelog.
+>
+> To check the live interface yourself:
+> ```bash
+> stellar contract info interface --id CCKPD2MPAYQYCL7QJKUMJHTEJWNHSIP7BZYIZBRO3C4DM4VHZKL6VBRL --network testnet
+> stellar contract info meta --id CCKPD2MPAYQYCL7QJKUMJHTEJWNHSIP7BZYIZBRO3C4DM4VHZKL6VBRL --network testnet
+> ```
+>
+> To verify a deployment matches a local build, run
+> `./scripts/verify-deployment.sh` (see issue #128).
+
+The testnet deployment settles in the testnet USDC SAC below. The `@demo` jar
+mentioned in earlier revisions may no longer be present — verify with
+`get_jar` before relying on it.
 
 USDC Stellar Asset Contract addresses:
 
