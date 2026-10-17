@@ -1,9 +1,18 @@
 .PHONY: build optimize test fmt lint clean deploy check-docs
 .PHONY: build optimize test fmt lint clean deploy ci lint-scripts
+.PHONY: build optimize test fmt lint clean deploy check-docs check-msrv interface deny
+.PHONY: build optimize test fmt lint clean deploy ci
 
 # Build all contracts to wasm (requires the Stellar CLI).
+# Embeds source repo and commit in the wasm metadata (#127).
 build:
-	stellar contract build
+	@REPO="github:Novatip/novatip-contracts"; \
+	COMMIT=$$(git rev-parse --short HEAD 2>/dev/null || echo "unknown"); \
+	DIRTY=""; \
+	if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then DIRTY="-dirty"; fi; \
+	stellar contract build \
+		--meta source_repo=$$REPO \
+		--meta source_commit=$$COMMIT$$DIRTY
 
 # Optimize the built tip_splitter wasm and print the before/after size.
 # Run `make build` first.
@@ -22,7 +31,7 @@ optimize:
 
 # Run the test suite.
 test:
-	cargo test
+	cargo test --locked
 
 # Auto-format all code.
 fmt:
@@ -30,7 +39,7 @@ fmt:
 
 # Lint and fail on any warning (matches CI).
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
 
 # Lint shell scripts with shellcheck (#125).
 lint-scripts:
@@ -52,7 +61,19 @@ check-docs:
 # including the wasm build and size check.
 ci:
 	cargo fmt --all -- --check
-	cargo clippy --all-targets -- -D warnings
-	cargo test
-	cargo build --target wasm32-unknown-unknown --release
+	cargo clippy --locked --all-targets -- -D warnings
+	cargo test --locked
+	cargo build --locked --target wasm32-unknown-unknown --release
 	./scripts/check-wasm-size.sh
+
+# Regenerate the committed public interface snapshot (#134).
+interface:
+	./scripts/update-interface.sh
+
+# Fail when rust-toolchain.toml and workspace rust-version disagree (#133).
+check-msrv:
+	./scripts/check-msrv.sh
+
+# Dependency advisory / license / ban audit (#132).
+deny:
+	cargo deny check

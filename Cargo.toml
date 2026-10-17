@@ -7,6 +7,8 @@ resolver = "3"
 members = ["contracts/*", "examples/*"]
 
 [workspace.package]
+# Keep major.minor in sync with channel in rust-toolchain.toml (CI check-msrv).
+edition = "2021"
 rust-version = "1.84"
 
 [workspace.dependencies]
