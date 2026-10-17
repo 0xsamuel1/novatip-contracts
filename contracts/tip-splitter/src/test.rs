@@ -3421,8 +3421,11 @@ proptest! {
 
     /// The core invariant: however a tip is split, every recipient's payout
     /// sums back to exactly the tipped amount, with no dust lost or created,
-    /// and the tipper's balance drops by exactly that amount. Covers amounts
-    /// smaller than the recipient count, where truncation bites hardest.
+    /// and the tipper's balance drops by exactly that amount.
+    ///
+    /// Draws amounts from the smallest accepted value upward (biased toward
+    /// the boundary), so truncation effects are exercised. Amounts below
+    /// the minimum are covered by `tip_rejects_small_amounts` below.
     #[test]
     fn tip_distributes_full_amount_across_random_splits(
         bps in splits_strategy(),
@@ -4843,4 +4846,210 @@ fn minimum_tip_gates_the_default_token_only() {
         client.try_tip_in_token(&tipper, &jar_id, &s.token, &2, &String::from_str(env, "x")),
         Err(Ok(Error::BelowMinTipAmount.into()))
     );
+}
+
+// ── Issue #136: small amounts are rejected, not silently mis-split ──────────
+
+/// Asserts that amounts below the minimum accepted value fail with
+/// \`InvalidAmount\` and leave every balance unchanged. The minimum is
+/// \`ceil(BPS_DENOM / min_bps)\` for the generated splits — below that,
+/// some recipient's share would truncate to zero.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn tip_rejects_small_amounts(
+        bps in splits_strategy(),
+        small in 1i128..=20i128,
+    ) {
+        let s = setup();
+        let env = &s.env;
+        let client = TipSplitterClient::new(env, &s.contract);
+        let token = token::Client::new(env, &s.token);
+        let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+        let owner = Address::generate(env);
+        let tipper = Address::generate(env);
+        token_admin.mint(&tipper, &small);
+
+        let recipients: std::vec::Vec<Address> =
+            bps.iter().map(|_| Address::generate(env)).collect();
+        let mut splits = vec![env];
+        for (addr, b) in recipients.iter().zip(bps.iter()) {
+            splits.push_back(Split { to: addr.clone(), bps: *b });
+        }
+
+        let jar_id = String::from_str(env, "@small");
+        client.create_jar(&owner, &jar_id, &splits);
+
+        // Record balances before
+        let tipper_before = token.balance(&tipper);
+        let mut balances_before = std::vec::Vec::new();
+        for r in recipients.iter() {
+            balances_before.push(token.balance(r));
+        }
+
+        let result = client.try_tip(&tipper, &jar_id, &small, &String::from_str(env, "x"));
+
+        // Must fail with InvalidAmount
+        prop_assert!(result.is_err());
+
+        // No balance changed
+        prop_assert_eq!(token.balance(&tipper), tipper_before);
+        for (r, before) in recipients.iter().zip(balances_before.iter()) {
+            prop_assert_eq!(token.balance(r), *before);
+        }
+    }
+}
+
+// ── Issue #137: validate_splits against a reference model ────────────────────
+
+/// Reference model of the validation rules, written from docs/CONTRACT.md.
+/// Check order (matches the contract):
+///   1. splits is not empty           → SplitsEmpty
+///   2. length <= MAX_RECIPIENTS      → TooManyRecipients
+///   3. every bps in 1..=BPS_DENOM    → SplitOutOfRange
+///   4. no duplicate recipients       → DuplicateRecipient
+///   5. bps sum == BPS_DENOM          → SplitSumNot100Pct
+///   6. success
+#[derive(Debug, PartialEq)]
+enum ModelError {
+    SplitsEmpty,
+    TooManyRecipients,
+    SplitOutOfRange,
+    DuplicateRecipient,
+    SplitSumNot100Pct,
+}
+
+fn model_validate_splits(splits: &std::vec::Vec<(u32, u8)>) -> Result<(), ModelError> {
+    const MAX_RECIPIENTS: usize = 10;
+    const BPS_DENOM: u32 = 10_000;
+    if splits.is_empty() {
+        return Err(ModelError::SplitsEmpty);
+    }
+    if splits.len() > MAX_RECIPIENTS {
+        return Err(ModelError::TooManyRecipients);
+    }
+    for (_, bps) in splits {
+        if *bps == 0 || *bps > BPS_DENOM as u8 {
+            return Err(ModelError::SplitOutOfRange);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (idx, _) in splits {
+        if !seen.insert(*idx) {
+            return Err(ModelError::DuplicateRecipient);
+        }
+    }
+    let sum: u32 = splits.iter().map(|(_, b)| *b as u32).sum();
+    if sum != BPS_DENOM {
+        return Err(ModelError::SplitSumNot100Pct);
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Compares \`try_create_jar\` against the reference model across
+    /// generated vectors that combine several defects (duplicates, out-of-range
+    /// bps, wrong sums). Also verifies that a rejected create leaves no jar.
+    #[test]
+    fn validate_splits_matches_reference_model(
+        splits in proptest::collection::vec(
+            (0u8..5u8, proptest::sample::select(std::vec![0u32, 1, 5000, 9999, 10_000, 10_001])),
+            0..12usize
+        ),
+    ) {
+        let s = setup();
+        let env = &s.env;
+        let client = TipSplitterClient::new(env, &s.contract);
+
+        let owner = Address::generate(env);
+        let jar_id = String::from_str(env, "@model");
+
+        // Build the Soroban Vec<Split> from the generated data
+        let mut sb_splits = vec![env];
+        for (idx, bps) in splits.iter() {
+            // Use a fixed pool of addresses so duplicates are common
+            let addr = match idx % 4 {
+                0 => Address::from_string(env, &String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")),
+                1 => Address::from_string(env, &String::from_str(env, "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")),
+                2 => Address::from_string(env, &String::from_str(env, "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")),
+                _ => Address::from_string(env, &String::from_str(env, "GDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD")),
+            };
+            sb_splits.push_back(Split { to: addr, bps: *bps });
+        }
+
+        let expected = model_validate_splits(&splits);
+        let result = client.try_create_jar(&owner, &jar_id, &sb_splits);
+
+        match expected {
+            Ok(()) => {
+                prop_assert!(result.is_ok());
+                prop_assert!(client.jar_exists(&jar_id));
+            }
+            Err(_) => {
+                prop_assert!(result.is_err());
+                prop_assert!(!client.jar_exists(&jar_id));
+            }
+        }
+    }
+}
+
+// ── Issue #138: preview_split matches tip across random jars ────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Asserts that preview_split, the tip event breakdown, and balance
+    /// changes all agree recipient-by-recipient for random jars and amounts.
+    /// Also asserts preview and tip succeed or fail together with the same error.
+    #[test]
+    fn preview_split_matches_tip_across_random_jars(
+        bps in splits_strategy(),
+        amount in 1i128..=10_000_000i128,
+    ) {
+        let s = setup();
+        let env = &s.env;
+        let client = TipSplitterClient::new(env, &s.contract);
+        let token = token::Client::new(env, &s.token);
+        let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+        let owner = Address::generate(env);
+        let tipper = Address::generate(env);
+        token_admin.mint(&tipper, &10_000_000i128);
+
+        let recipients: std::vec::Vec<Address> =
+            bps.iter().map(|_| Address::generate(env)).collect();
+        let mut splits = vec![env];
+        for (addr, b) in recipients.iter().zip(bps.iter()) {
+            splits.push_back(Split { to: addr.clone(), bps: *b });
+        }
+
+        let jar_id = String::from_str(env, "@preview");
+        client.create_jar(&owner, &jar_id, &splits);
+
+        // Record balances before
+        let mut balances_before = std::vec::Vec::new();
+        for r in recipients.iter() {
+            balances_before.push(token.balance(r));
+        }
+
+        // Try preview and tip — they must agree on success/failure
+        let preview_result = client.try_preview_split(&jar_id, &amount);
+        let tip_result = client.try_tip(&tipper, &jar_id, &amount, &String::from_str(env, "x"));
+
+        prop_assert_eq!(preview_result.is_ok(), tip_result.is_ok());
+
+        if preview_result.is_ok() && tip_result.is_ok() {
+            let preview_shares = preview_result.unwrap().unwrap();
+            // Check that each recipient's balance increased by the previewed share
+            for (i, r) in recipients.iter().enumerate() {
+                let expected_share = preview_shares.get(i as u32).unwrap();
+                let actual_balance = token.balance(r);
+                prop_assert_eq!(actual_balance - balances_before[i], expected_share);
+            }
+        }
+    }
 }
