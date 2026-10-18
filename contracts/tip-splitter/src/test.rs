@@ -253,15 +253,15 @@ fn tip_emits_tip_event_with_expected_topics_and_data() {
     let decoded: TipEventData = TryFromVal::try_from_val(env, data).expect("tip event data shape");
     assert_eq!(
         decoded,
-        (
-            tipper,
-            100i128,
+        TipEvent {
+            from: tipper,
+            amount: 100i128,
             message,
-            vec![env, (alice, 100i128, false)],
-            s.token.clone(),
+            breakdown: vec![env, (alice, 100i128, false)],
+            token: s.token.clone(),
             seq,
-            None
-        )
+            reference: None,
+        }
     );
     // The number returned to the caller is the one published in the event.
     assert_eq!(seq, 1);
@@ -288,9 +288,9 @@ fn tip_seq_and_references(
         .iter()
         .filter(|e| e.0 == *contract && e.1 == expected_topics)
         .map(|(_, _, data)| {
-            let (_, _, _, _, _, seq, reference): TipEventData =
+            let decoded: TipEventData =
                 TryFromVal::try_from_val(env, &data).expect("tip event data shape");
-            (seq, reference)
+            (decoded.seq, decoded.reference)
         })
         .collect()
 }
@@ -600,15 +600,7 @@ fn reference_is_not_stored_and_not_required_to_be_unique() {
 /// `from`, `amount`, `message`, `breakdown`, then the appended fields — the
 /// token the tip was paid in (#170), the tip's sequence number, and its
 /// optional client reference.
-type TipEventData = (
-    Address,
-    i128,
-    String,
-    Vec<(Address, i128, bool)>,
-    Address,
-    u64,
-    Option<BytesN<32>>,
-);
+type TipEventData = TipEvent;
 
 /// Reads the per-recipient breakdown out of the single `tip` event this
 /// contract published.
@@ -626,8 +618,8 @@ fn tip_breakdown(env: &Env, contract: &Address, jar_id: &String) -> std::vec::Ve
         .collect();
     assert_eq!(events.len(), 1, "expected exactly one tip event");
     let (_, _, data) = events.first().unwrap();
-    let (_, _, _, breakdown, _, _, _): TipEventData =
-        TryFromVal::try_from_val(env, data).expect("tip event data shape");
+    let decoded: TipEventData = TryFromVal::try_from_val(env, data).expect("tip event data shape");
+    let breakdown = decoded.breakdown;
     (0..breakdown.len())
         .map(|i| {
             let (to, moved, _held) = breakdown.get(i).unwrap();
@@ -2098,8 +2090,8 @@ fn create_jar_emits_jar_created_event() {
             jar_id.into_val(env)
         ]
     );
-    let decoded: Address = TryFromVal::try_from_val(env, data).expect("jar_crtd event data shape");
-    assert_eq!(decoded, owner);
+    let decoded: JarCreatedEvent = TryFromVal::try_from_val(env, data).expect("jar_crtd event data shape");
+    assert_eq!(decoded.owner, owner);
 }
 
 #[test]
@@ -2152,8 +2144,8 @@ fn update_splits_emits_splits_event() {
         .collect();
     assert_eq!(splits_events.len(), 1);
     let (_, _, data) = splits_events.first().unwrap();
-    let decoded: u32 = TryFromVal::try_from_val(env, data).expect("splits event data shape");
-    assert_eq!(decoded, new_splits.len());
+    let decoded: SplitsUpdatedEvent = TryFromVal::try_from_val(env, data).expect("splits event data shape");
+    assert_eq!(decoded.count, new_splits.len());
 }
 
 #[test]
@@ -2589,7 +2581,9 @@ fn jar_xfer_owners(env: &Env, contract: &Address, jar_id: &String) -> (Address, 
         .collect();
     assert_eq!(events.len(), 1, "expected exactly one jar_xfer event");
     let (_, _, data) = events.first().unwrap();
-    TryFromVal::try_from_val(env, data).expect("jar_xfer event data shape")
+    let decoded: JarTransferredEvent =
+        TryFromVal::try_from_val(env, data).expect("jar_xfer event data shape");
+    (decoded.previous_owner, decoded.new_owner)
 }
 
 /// The `jar_xfer` event must name both ends of the move. An indexer replaying a
@@ -3215,8 +3209,8 @@ fn set_min_tip_amount_emits_event() {
         .collect();
     assert_eq!(min_events.len(), 1);
     let (_, _, data) = min_events.first().unwrap();
-    let decoded: Option<i128> = TryFromVal::try_from_val(env, data).expect("min_tip event data");
-    assert_eq!(decoded, Some(250_i128));
+    let decoded: MinTipEvent = TryFromVal::try_from_val(env, data).expect("min_tip event data");
+    assert_eq!(decoded.amount, Some(250_i128));
 }
 
 #[test]
@@ -7030,8 +7024,8 @@ fn clearing_minimum_publishes_none_and_allows_a_smaller_tip() {
         .collect();
     assert_eq!(events.len(), 1);
     let (_, _, data) = events.first().unwrap();
-    let decoded: Option<i128> = TryFromVal::try_from_val(env, data).expect("min_tip event data");
-    assert_eq!(decoded, None);
+    let decoded: MinTipEvent = TryFromVal::try_from_val(env, data).expect("min_tip event data");
+    assert_eq!(decoded.amount, None);
 
     client.tip(&tipper, &jar_id, &100_i128, &String::from_str(env, "small"));
     assert_eq!(token.balance(&alice), 100);

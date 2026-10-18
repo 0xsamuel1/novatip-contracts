@@ -213,7 +213,7 @@ pub struct Recurring {
     pub next_due_ledger: u32,
 }
 
-#[contracttype]
+#[contracttype(export = false)]
 pub enum DataKey {
     /// Contract admin (deployer); reserved for future migrations.
     Admin,
@@ -266,14 +266,23 @@ pub enum DataKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// The contract has not been initialized.
     NotInitialized = 1,
+    /// The requested jar id is already registered.
     JarExists = 2,
+    /// The requested jar id is not registered.
     JarNotFound = 3,
+    /// Retired error; use `SplitsEmpty`, `SplitOutOfRange` or `SplitSumNot100Pct`.
     InvalidSplits = 4,
+    /// The amount is non-positive, too small to split, or would overflow.
     InvalidAmount = 5,
+    /// The split list exceeds the recipient limit.
     TooManyRecipients = 6,
+    /// The split list contains the same recipient more than once.
     DuplicateRecipient = 7,
+    /// The tip message exceeds the byte-length limit.
     MessageTooLong = 8,
+    /// The jar id is empty or exceeds the byte-length limit.
     InvalidJarId = 9,
     /// Splits list is empty.
     SplitsEmpty = 10,
@@ -339,6 +348,48 @@ pub trait TipHook {
 
 #[contract]
 pub struct TipSplitter;
+
+/// Data published by `jar_crtd`; fields are named for forward-compatible decoding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JarCreatedEvent {
+    pub owner: Address,
+}
+
+/// Data published by `splits`; fields are named for forward-compatible decoding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitsUpdatedEvent {
+    pub count: u32,
+}
+
+/// Data published by `jar_xfer`; fields are named for forward-compatible decoding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JarTransferredEvent {
+    pub previous_owner: Address,
+    pub new_owner: Address,
+}
+
+/// Data published by `min_tip`; fields are named for forward-compatible decoding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinTipEvent {
+    pub amount: Option<i128>,
+}
+
+/// Data published by `tip`; fields are named for forward-compatible decoding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipEvent {
+    pub from: Address,
+    pub amount: i128,
+    pub message: String,
+    pub breakdown: Vec<(Address, i128, bool)>,
+    pub token: Address,
+    pub seq: u64,
+    pub reference: Option<BytesN<32>>,
+}
 
 #[contractimpl]
 impl TipSplitter {
@@ -445,7 +496,7 @@ impl TipSplitter {
         );
 
         env.events()
-            .publish((symbol_short!("jar_crtd"), jar_id), owner);
+            .publish((symbol_short!("jar_crtd"), jar_id), JarCreatedEvent { owner });
     }
 
     /// Update an existing jar's splits. Only the jar owner may do this.
@@ -504,7 +555,7 @@ impl TipSplitter {
         );
 
         env.events()
-            .publish((symbol_short!("splits"), jar_id), split_count);
+            .publish((symbol_short!("splits"), jar_id), SplitsUpdatedEvent { count: split_count });
     }
 
     /// Lock a jar's splits so the owner can no longer reduce or remove a
@@ -711,8 +762,10 @@ impl TipSplitter {
         // only the new owner, an indexer starting from a partial history can
         // see where a jar went but not where it came from, unless it has
         // already replayed every prior event for that jar.
-        env.events()
-            .publish((symbol_short!("jar_xfer"), jar_id), (prev_owner, new_owner));
+        env.events().publish(
+            (symbol_short!("jar_xfer"), jar_id),
+            JarTransferredEvent { previous_owner: prev_owner, new_owner },
+        );
     }
 
     /// Set an optional minimum tip amount for a jar. Only the jar owner may do this.
@@ -750,7 +803,7 @@ impl TipSplitter {
         }
 
         env.events()
-            .publish((symbol_short!("min_tip"), jar_id), min_amount);
+            .publish((symbol_short!("min_tip"), jar_id), MinTipEvent { amount: min_amount });
     }
 
     /// Send a tip of `amount` of the deploy-time default token from `from`,
@@ -1029,23 +1082,12 @@ impl TipSplitter {
             + 1;
         env.storage().instance().set(&DataKey::TipCount, &seq);
 
-        // The token, the sequence number and the reference are appended after
-        // the four elements `decodeTipEvent` originally read, in this fixed
-        // order, so a positional decoder keeps working and the new fields
-        // occupy documented slots. None joins the topics: the SDK's
-        // `tipTopicFilter` asserts one segment per published topic, so a third
-        // topic would make its existing two-segment filter match nothing.
         env.events().publish(
             (symbol_short!("tip"), jar_id.clone()),
-            (
-                from.clone(),
-                amount,
-                message.clone(),
-                breakdown,
-                token_addr.clone(),
-                seq,
-                reference,
-            ),
+            TipEvent {
+                from: from.clone(), amount, message: message.clone(), breakdown,
+                token: token_addr.clone(), seq, reference,
+            },
         );
 
         // Post-tip hook (#176): only now, after the funds and the event are
@@ -2046,12 +2088,9 @@ impl TipSplitter {
         shares
     }
 
-    /// Validate that splits are non-empty, within bounds, carry a share that is
-    /// neither zero nor above 100% each, and sum to exactly 100%.
+    /// Validate splits in one pass: range, duplicate recipient, then total sum.
     ///
-    /// A `bps == 0` entry would never be paid — `tip` skips zero shares — so it
-    /// is dead weight that still consumes a slot against `MAX_RECIPIENTS` and
-    /// misleads clients into showing a collaborator who never receives funds.
+    /// A zero-bps entry is dead weight that consumes a slot and misleads clients.
     ///
     /// A `bps > BPS_DENOM` entry claims more than the whole tip, so it can never
     /// belong to a set summing to 100%. Rejecting it per entry also bounds the
@@ -2066,6 +2105,7 @@ impl TipSplitter {
             panic_with_error!(env, Error::TooManyRecipients);
         }
         let mut total: u32 = 0;
+        let mut seen: Vec<Address> = Vec::new(env);
         for i in 0..n {
             let split = splits.get(i).unwrap();
             let bps = split.bps;
@@ -2081,14 +2121,10 @@ impl TipSplitter {
             total = total
                 .checked_add(bps)
                 .unwrap_or_else(|| panic_with_error!(env, Error::SplitSumNot100Pct));
-            // Pairwise comparison rather than a set: `n` is capped at
-            // MAX_RECIPIENTS (20), so this is at most 190 comparisons, and a hash
-            // set would need an allocator we don't have under `no_std`.
-            for j in (i + 1)..n {
-                if splits.get(j).unwrap().to == split.to {
-                    panic_with_error!(env, Error::DuplicateRecipient);
-                }
+            if seen.contains(&split.to) {
+                panic_with_error!(env, Error::DuplicateRecipient);
             }
+            seen.push_back(split.to);
         }
         if total != BPS_DENOM {
             panic_with_error!(env, Error::SplitSumNot100Pct);

@@ -54,6 +54,7 @@ deploy:
 # Build the contract and fail if docs/CONTRACT.md's function or error tables
 # no longer match the built interface (requires the Stellar CLI and jq).
 check-docs:
+	./scripts/check-doc-length.sh
 	./scripts/check-docs.sh
 # Run everything CI checks, in the same order with the same flags,
 # including the wasm build and size check.

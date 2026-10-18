@@ -550,7 +550,7 @@ above. A bare `Error(Contract, #10)` with no source is ambiguous between
 ### `jar_crtd` — published on every successful `create_jar`
 
 - **Topics:** `(symbol "jar_crtd", jar_id: String)`
-- **Data:** `owner: Address`
+- **Data:** `JarCreatedEvent { owner: Address }`
 
 Indexers must subscribe to this event to build and maintain the full list of
 registered jars. There is no on-chain `get_jar_ids` function — event scanning
@@ -564,7 +564,7 @@ log or an indexer's jar list just to validate a name.
 ### `splits` — published on every successful `update_splits`
 
 - **Topics:** `(symbol "splits", jar_id: String)`
-- **Data:** `split_count: u32`
+- **Data:** `SplitsUpdatedEvent { count: u32 }`
 
 Lets an indexer that has cached a jar's splits know they went stale, without
 having to re-poll every jar on a schedule. The indexer refetches the jar via
@@ -573,7 +573,7 @@ having to re-poll every jar on a schedule. The indexer refetches the jar via
 ### `jar_xfer` — published on every successful `transfer_jar_ownership`
 
 - **Topics:** `(symbol "jar_xfer", jar_id: String)`
-- **Data:** `(prev_owner: Address, new_owner: Address)`
+- **Data:** `JarTransferredEvent { previous_owner: Address, new_owner: Address }`
 
 Lets an indexer update who controls a jar without re-polling `get_jar` for
 every jar on a schedule.
@@ -592,21 +592,20 @@ may transfer a jar — and is always different from `new_owner` in practice,
 though the contract does not reject a transfer to the existing owner. Splits
 are unchanged by a transfer, so no `splits` event accompanies this one.
 
-> **Consumer impact.** The data was a bare `Address` and is now a
-> two-element tuple. A decoder that reads it as a single address must be
-> updated before it reads events from a contract built from this version.
+> **Consumer impact.** Event data is a named map. Decoders should read fields
+> by name and ignore unknown fields added in future versions.
 
 ### `min_tip` — published on every successful `set_min_tip_amount`
 
 - **Topics:** `(symbol "min_tip", jar_id: String)`
-- **Data:** `min_amount: Option<i128>`
+- **Data:** `MinTipEvent { amount: Option<i128> }`
 
 Lets indexers track the current minimum tip floor for a jar without polling `get_min_tip_amount`.
 
 ### `tip` — published on every successful tip
 
 - **Topics:** `(symbol "tip", jar_id: String)`
-- **Data:** `(from: Address, amount: i128, message: String, breakdown: Vec<(Address, i128, bool)>, token: Address, seq: u64, reference: Option<BytesN<32>>)
+- **Data:** `TipEvent { from, amount, message, breakdown, token, seq, reference }`
 
   Published by `tip`, `tip_with_ref`, `tip_in_token`, and — with the supporter
   as `from` and an explicit `None` reference — `collect_recurring` (#175), all
@@ -626,12 +625,9 @@ on the exact amount. The `moved` values sum to at most `amount`: a recipient
 who is also the sender is reported with `moved = 0`, and their notional share
 rolls into the last recipient instead of transferring at all (see below).
 
-The seven elements occupy fixed, documented positions, in the order above,
-and that order is part of the public interface: `from`, `amount`, `message`
-and `breakdown` keep the positions they had, and `token`, `seq` and
-`reference` were appended after them. Every settle path publishes all seven,
-so one decoder serves all entry points — an absent reference is an explicit
-`None` in position seven, never a shorter tuple.
+All fields are named in the event map. Every settle path publishes the same
+fields — an absent reference is an explicit `None` — so consumers can decode
+by field name and ignore fields added by future versions.
 
 The `held` flag distinguishes a **delivered** share (`false`) from one the
 contract could not deliver and has escrowed for later withdrawal (`true`, #171).
@@ -1098,15 +1094,8 @@ It is exactly 32 bytes (`Option<BytesN<32>>`): enough for a binary UUID, a
 the way an unbounded string would. The entry point is `tip_with_ref`; `tip` is
 unchanged and remains the positional call the SDK and the web tip form use.
 
-> **Consumer impact.** The data tuple grew from four elements to six. A
-> positional decoder — `decodeTipEvent` in `@novatip/sdk`, and the backend
-> indexer — must be updated to accept `seq` and `reference` before it reads
-> events from a contract built from this version. The first four elements are
-> unchanged and keep their positions, so a consumer that ignores trailing
-> elements is unaffected. `tip` now also *returns* a `u64` where it previously
-> returned nothing; callers that ignored the empty result keep working, and the
-> web tip form can use the returned number to link the supporter to the tip they
-> just sent.
+> **Consumer impact.** SDK and backend decoders must switch from tuple
+> destructuring to named fields. Unknown fields can be ignored safely.
 >
 > An earlier change in the same section took the tuple from three elements to
 > four by appending `breakdown`; that wording describes the `breakdown` addition
