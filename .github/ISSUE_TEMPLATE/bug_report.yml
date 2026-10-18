@@ -32,7 +32,7 @@ body:
     id: contract-id
     attributes:
       label: Contract id
-      description: The C... id of the tip_splitter deployment you hit this against (the contents of .contract-id).
+      description: The C... id of the tip_splitter deployment you hit this against (the contents of .contract-id.<NETWORK>).
       placeholder: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB6
     validations:
       required: true

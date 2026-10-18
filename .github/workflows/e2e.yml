@@ -108,7 +108,7 @@ jobs:
       - name: Assert jar state via get_jar
         run: |
           set -euo pipefail
-          JAR=$(stellar contract invoke --id "$(cat .contract-id)" --source deployer --network local -- \
+          JAR=$(stellar contract invoke --id "$(cat .contract-id.local)" --source deployer --network local -- \
             get_jar --jar_id testjar)
           echo "jar: ${JAR}"
           echo "${JAR}" | jq -e '.splits | length == 2' >/dev/null || { echo "FAIL: jar should have 2 splits"; exit 1; }

@@ -20,21 +20,23 @@ set -euo pipefail
 # Usage:  ./scripts/deploy.sh
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
+. "${NOVATIP_ROOT}/scripts/lib/cli.sh"
 
 require_env NETWORK SOURCE ADMIN USDC_TOKEN
+require_stellar_cli
 
 # Canonical USDC Stellar Asset Contract ids per network. Must match the
-# table in README.md (lines 53-58). (#123)
-declare -A KNOWN_USDC_SAC=(
-  [testnet]="CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
-  [mainnet]="CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
-  [local]=""
-)
+# table in README.md. A case statement (not an associative array) keeps this
+# working under macOS's bash 3.2 (#120).
+known=""
+case "${NETWORK}" in
+  testnet | mainnet) known="CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75" ;;
+  local) known="" ;;
+esac
 
 # Reject a USDC_TOKEN that doesn't match the known SAC for the chosen
 # network. `local` has no canonical token so it always passes. (#123)
 if [ "${NETWORK}" != "local" ] && [ -z "${ALLOW_CUSTOM_TOKEN:-}" ]; then
-  known="${KNOWN_USDC_SAC[${NETWORK}]:-}"
   if [ -n "${known}" ] && [ "${USDC_TOKEN}" != "${known}" ]; then
     echo "error: USDC_TOKEN does not match the known USDC SAC for ${NETWORK}." >&2
     echo "  known: ${known}" >&2
@@ -67,16 +69,14 @@ REPO="github:Novatip/novatip-contracts"
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DIRTY=""
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then DIRTY="-dirty"; fi
+# `--optimize` is the current CLI's supported way to produce the deploy
+# artifact; the separate optimize subcommand is deprecated (#121).
 stellar contract build \
+  --optimize \
   --meta source_repo="${REPO}" \
   --meta source_commit="${COMMIT}${DIRTY}"
 
-# The Stellar CLI moved its wasm target from wasm32-unknown-unknown to
-# wasm32v1-none, so the output path differs by CLI version. Locate the artifact
-# rather than hardcoding either path, newest first.
-WASM="$(find target -name 'tip_splitter.wasm' -path '*release*' -not -path '*/deps/*' \
-        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
-
+WASM="$(./scripts/find-wasm.sh || true)"
 if [ -z "${WASM}" ] || [ ! -f "${WASM}" ]; then
   echo "error: no built tip_splitter.wasm found under target/." >&2
   echo "       If the build printed a missing-target error, run:" >&2
@@ -84,19 +84,8 @@ if [ -z "${WASM}" ] || [ ! -f "${WASM}" ]; then
   exit 1
 fi
 
-BUILT_SIZE=$(wc -c < "${WASM}")
-echo "==> Built ${WASM} (${BUILT_SIZE} bytes)"
-
-echo "==> Optimizing wasm"
-stellar contract optimize --wasm "${WASM}"
-OPTIMIZED_WASM="${WASM%.wasm}.optimized.wasm"
-if [ ! -f "${OPTIMIZED_WASM}" ]; then
-  echo "error: expected optimized wasm at ${OPTIMIZED_WASM}" >&2
-  exit 1
-fi
-OPTIMIZED_SIZE=$(wc -c < "${OPTIMIZED_WASM}")
-echo "==> Optimized ${OPTIMIZED_WASM} (${BUILT_SIZE} -> ${OPTIMIZED_SIZE} bytes, $((BUILT_SIZE - OPTIMIZED_SIZE)) saved)"
-WASM="${OPTIMIZED_WASM}"
+WASM_SIZE=$(wc -c < "${WASM}")
+echo "==> Built optimized ${WASM} (${WASM_SIZE} bytes)"
 
 echo "==> Deploying tip_splitter to ${NETWORK}"
 CONTRACT_ID=$(stellar contract deploy \
@@ -107,6 +96,7 @@ CONTRACT_ID=$(stellar contract deploy \
   --admin "${ADMIN}" \
   --token "${USDC_TOKEN}")
 
+CONTRACT_ID_FILE=".contract-id.${NETWORK}"
 echo "==> Deployed contract id: ${CONTRACT_ID}"
-echo "${CONTRACT_ID}" > .contract-id
-echo "    (saved to .contract-id)"
+echo "${CONTRACT_ID}" > "${CONTRACT_ID_FILE}"
+echo "    (saved to ${CONTRACT_ID_FILE})"

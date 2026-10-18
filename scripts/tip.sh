@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # Required env (see .env.example):
 #   NETWORK, SOURCE, JAR_ID, AMOUNT
-#   CONTRACT_ID  (optional; defaults to the contents of .contract-id)
+#   CONTRACT_ID  (optional; defaults to .contract-id.<NETWORK>)
 #   RECIPIENT    (optional; defaults to jar owner for single-recipient jars)
 #
 # Usage:  ./scripts/tip.sh
@@ -17,7 +17,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
 
 require_env NETWORK SOURCE JAR_ID AMOUNT
-CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+require_contract_id
 
 echo "==> Sending tip of ${AMOUNT} to jar ${JAR_ID} on ${CONTRACT_ID}"
 stellar contract invoke \

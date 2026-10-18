@@ -39,9 +39,8 @@ if ! "${STELLAR_BIN}" contract build; then
   exit 1
 fi
 
-# Same artifact lookup as deploy.sh: newest built wasm, either CLI target dir.
-WASM="$(find target -name 'tip_splitter.wasm' -path '*release*' -not -path '*/deps/*' \
-        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+# Same artifact lookup as deploy.sh/Makefile (#120).
+WASM="$(./scripts/find-wasm.sh || true)"
 if [ -z "${WASM}" ] || [ ! -f "${WASM}" ]; then
   echo "error: no built tip_splitter.wasm found under target/." >&2
   exit 1

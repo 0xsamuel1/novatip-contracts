@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # Required env (see .env.example):
 #   NETWORK, SOURCE, OWNER, SLUG
-#   CONTRACT_ID  (optional; defaults to the contents of .contract-id)
+#   CONTRACT_ID  (optional; defaults to .contract-id.<NETWORK>)
 #
 # Recipients — either one of:
 #   RECIPIENT  single-recipient shorthand; builds the 100% split for you
@@ -31,7 +31,7 @@ set -euo pipefail
 . "${NOVATIP_ROOT}/scripts/lib/splits.sh"
 
 require_env NETWORK SOURCE OWNER SLUG
-CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+require_contract_id
 
 # Validate SLUG: 1–64 bytes (#124).
 SLUG_LEN=$(printf '%s' "${SLUG}" | wc -c)

@@ -15,7 +15,7 @@ set -euo pipefail
 #
 # Required env (see .env.example):
 #   NETWORK, SOURCE, SLUG
-#   CONTRACT_ID  (optional; defaults to the contents of .contract-id)
+#   CONTRACT_ID  (optional; defaults to .contract-id.<NETWORK>)
 #   AMOUNT       (optional) tip size in stroops to preview
 #
 # Usage:  ./scripts/jar-info.sh
@@ -24,7 +24,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
 
 require_env NETWORK SOURCE SLUG
-CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+require_contract_id
 
 invoke() {
   stellar contract invoke \

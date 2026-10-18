@@ -1163,7 +1163,7 @@ variables win over `.env`, and no manual `source` step is needed. They work
 when started from any directory.
 
 ```bash
-./scripts/deploy.sh        # deploys, writes .contract-id
+./scripts/deploy.sh        # deploys, writes .contract-id.<NETWORK>
 ./scripts/create-jar.sh    # registers an example jar
 ./scripts/set-min-tip.sh   # sets (or clears) a jar's minimum tip
 ./scripts/transfer-jar.sh  # hands a jar to a new owner

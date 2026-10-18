@@ -6036,7 +6036,9 @@ fn model_validate_splits(splits: &std::vec::Vec<(u8, u32)>) -> Result<(), ModelE
     }
     let mut seen = std::collections::HashSet::new();
     for (idx, _) in splits {
-        if !seen.insert(*idx) {
+        // The Soroban vector maps indices into a pool of four addresses, so
+        // duplicates are on `idx % 4`, not the raw index.
+        if !seen.insert(*idx % 4) {
             return Err(ModelError::DuplicateRecipient);
         }
     }
@@ -7080,4 +7082,186 @@ fn rejected_below_min_tip_leaves_all_balances_unchanged() {
     assert_eq!(token.balance(&alice), alice_before);
     assert_eq!(token.balance(&bob), bob_before);
     assert_eq!(token.balance(&tipper), tipper_before);
+}
+
+/// A tip authorization commits to the current split recipients and shares.
+///
+/// `tip` calls the token's `transfer` once per recipient. Those nested calls
+/// each run `from.require_auth()`, so the supporter's signed authorization
+/// covers the recipient addresses and exact amounts — not just
+/// `tip(from, jar_id, amount, message)`. This test builds that authorization
+/// explicitly and pins the guarantee: the same signature succeeds while the
+/// splits are unchanged, but is rejected after the owner rewrites them, so an
+/// owner cannot redirect a tip that was already signed. A future refactor that
+/// pulled the whole amount into the contract before paying recipients would
+/// lose this property and fail here.
+#[test]
+fn tip_stale_authorization_is_rejected_after_splits_change() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &100);
+
+    let jar_id = String::from_str(env, "@stale-auth");
+    let message = String::from_str(env, "signed before the change");
+    let original = vec![
+        env,
+        Split {
+            to: alice.clone(),
+            bps: 7000,
+        },
+        Split {
+            to: bob.clone(),
+            bps: 3000,
+        },
+    ];
+    client.create_jar(&owner, &jar_id, &original);
+
+    let stale_sub_invokes = [
+        MockAuthInvoke {
+            contract: &s.token,
+            fn_name: "transfer",
+            args: (tipper.clone(), alice.clone(), 70i128).into_val(env),
+            sub_invokes: &[],
+        },
+        MockAuthInvoke {
+            contract: &s.token,
+            fn_name: "transfer",
+            args: (tipper.clone(), bob.clone(), 30i128).into_val(env),
+            sub_invokes: &[],
+        },
+    ];
+    let stale_auth = MockAuth {
+        address: &tipper,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "tip",
+            args: (tipper.clone(), jar_id.clone(), 100i128, message.clone()).into_val(env),
+            sub_invokes: &stale_sub_invokes,
+        },
+    };
+
+    // Positive control: the same authorization works while the splits match.
+    env.mock_auths(&[stale_auth.clone()]);
+    client.tip(&tipper, &jar_id, &100, &message);
+    assert_eq!(token.balance(&alice), 70);
+    assert_eq!(token.balance(&bob), 30);
+    assert_eq!(token.balance(&tipper), 0);
+
+    // The owner redirects the jar after the supporter signed.
+    let redirected_to = Address::generate(env);
+    let redirected = vec![
+        env,
+        Split {
+            to: redirected_to.clone(),
+            bps: 10000,
+        },
+    ];
+    env.mock_all_auths();
+    client.update_splits(&jar_id, &redirected);
+
+    // The stale signature no longer matches the transfers `tip` would make.
+    env.mock_auths(&[stale_auth]);
+    let res = client.try_tip(&tipper, &jar_id, &100, &message);
+    assert!(
+        res.is_err(),
+        "a tip authorized for the old splits must fail"
+    );
+
+    // Atomicity: nothing moved, and the redirect recipient got nothing.
+    assert_eq!(token.balance(&tipper), 0);
+    assert_eq!(token.balance(&redirected_to), 0);
+    assert_eq!(token.balance(&alice), 70);
+    assert_eq!(token.balance(&bob), 30);
+}
+
+/// The stale-auth guarantee survives `transfer_jar_ownership`: the new owner
+/// can rewrite the splits, and a tip signed against the old ones is still
+/// rejected. The authorization is bound to the transfer calls, not to who owns
+/// the jar when it lands.
+#[test]
+fn tip_stale_authorization_is_rejected_after_ownership_and_splits_change() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let new_owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &100);
+
+    let jar_id = String::from_str(env, "@stale-auth-transfer");
+    let message = String::from_str(env, "signed before the transfer");
+    let original = vec![
+        env,
+        Split {
+            to: alice.clone(),
+            bps: 7000,
+        },
+        Split {
+            to: bob.clone(),
+            bps: 3000,
+        },
+    ];
+    client.create_jar(&owner, &jar_id, &original);
+
+    let stale_sub_invokes = [
+        MockAuthInvoke {
+            contract: &s.token,
+            fn_name: "transfer",
+            args: (tipper.clone(), alice.clone(), 70i128).into_val(env),
+            sub_invokes: &[],
+        },
+        MockAuthInvoke {
+            contract: &s.token,
+            fn_name: "transfer",
+            args: (tipper.clone(), bob.clone(), 30i128).into_val(env),
+            sub_invokes: &[],
+        },
+    ];
+    let stale_auth = MockAuth {
+        address: &tipper,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "tip",
+            args: (tipper.clone(), jar_id.clone(), 100i128, message.clone()).into_val(env),
+            sub_invokes: &stale_sub_invokes,
+        },
+    };
+
+    client.transfer_jar_ownership(&jar_id, &new_owner);
+    let redirected_to = Address::generate(env);
+    env.mock_all_auths();
+    client.update_splits(
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: redirected_to.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    env.mock_auths(&[stale_auth]);
+    let res = client.try_tip(&tipper, &jar_id, &100, &message);
+    assert!(
+        res.is_err(),
+        "a tip authorized before ownership/splits changed must fail"
+    );
+    assert_eq!(token.balance(&tipper), 100);
+    assert_eq!(token.balance(&redirected_to), 0);
+    assert_eq!(token.balance(&alice), 0);
+    assert_eq!(token.balance(&bob), 0);
 }

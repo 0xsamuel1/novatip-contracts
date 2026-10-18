@@ -23,7 +23,7 @@ set -euo pipefail
 # Optional env:
 #   SOURCE       identity used for the read-only calls; default: first entry
 #                of IDENTITIES.
-#   CONTRACT_ID  optional; defaults to the contents of .contract-id (--check only)
+#   CONTRACT_ID  optional; defaults to .contract-id.<NETWORK> (--check only)
 #   SLUG         jar id, e.g. "@demo" — required with --check
 #   HORIZON_URL  override the Horizon endpoint used to read account balances
 #                (default per NETWORK: horizon-testnet / horizon / localhost:8000)
@@ -50,6 +50,8 @@ set -euo pipefail
 #       --asset "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" \
 #       --network testnet --amount 100                          # USDC from a holder
 
+. "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
+
 : "${NETWORK:?set NETWORK (testnet | mainnet | local)}"
 : "${USDC_TOKEN:?set USDC_TOKEN (the USDC Stellar Asset Contract id, C...)}"
 : "${IDENTITIES:?set IDENTITIES to one or more identity names or G... addresses}"
@@ -64,7 +66,7 @@ if [ "$#" -gt 0 ]; then
   exit 1
 fi
 if [ "${MODE}" = "check" ] && [ -n "${SLUG:-}" ]; then
-  CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+  require_contract_id
 fi
 
 command -v stellar >/dev/null 2>&1 || { echo "error: the stellar CLI is required" >&2; exit 1; }
@@ -75,7 +77,7 @@ case "${NETWORK}" in
   testnet)  HORIZON_URL="${HORIZON_URL:-https://horizon-testnet.stellar.org}" ;;
   mainnet)  HORIZON_URL="${HORIZON_URL:-https://horizon.stellar.org}" ;;
   local)    HORIZON_URL="${HORIZON_URL:-http://localhost:8000}" ;;
-  *)        HORIZON_URL="${HORIZON_URL:?set HORIZON_URL for unknown NETWORK '${NETWORK}'}" ;;
+  *)        HORIZON_URL="${HORIZON_URL:?set HORIZON_URL for unknown NETWORK ${NETWORK}}" ;;
 esac
 
 # Resolve an identity name to a G... address; pass through anything that

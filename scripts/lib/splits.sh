@@ -75,10 +75,10 @@ resolve_splits() {
       return 1
     fi
 
-    SPLITS_JSON="${SPLITS}"
+    export SPLITS_JSON="${SPLITS}"
   else
     : "${RECIPIENT:?set RECIPIENT or SPLITS}"
     SPLIT_COUNT=1
-    SPLITS_JSON="[{\"to\":\"${RECIPIENT}\",\"bps\":10000}]"
+    export SPLITS_JSON="[{\"to\":\"${RECIPIENT}\",\"bps\":10000}]"
   fi
 }

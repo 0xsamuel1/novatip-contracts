@@ -10,7 +10,7 @@ set -euo pipefail
 #   MIN_TIP      positive integer amount in the token's smallest unit (USDC:
 #                1_000_000 == 1 USDC). Unset, empty, or "none" clears the
 #                minimum so any positive tip is accepted again.
-#   CONTRACT_ID  optional; defaults to the contents of .contract-id
+#   CONTRACT_ID  optional; defaults to .contract-id.<NETWORK>
 #
 # Usage:  set -a; source .env; set +a; ./scripts/set-min-tip.sh
 #         MIN_TIP=5000000 ./scripts/set-min-tip.sh   # 5 USDC floor
@@ -34,7 +34,7 @@ set -euo pipefail
 : "${NETWORK:?set NETWORK}"
 : "${SOURCE:?set SOURCE}"
 : "${SLUG:?set SLUG}"
-CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+require_contract_id
 
 # Build the method argument list. `set -u` friendly: MIN_TIP is allowed to be
 # unset, which means "clear".
@@ -61,7 +61,7 @@ else
   fi
   # Strip leading zeros so the echo below and the CLI both see a canonical
   # integer; "000500" is the same floor as "500".
-  MIN_TIP_CANON=$(echo "${MIN_TIP}" | sed 's/^0*//')
+  MIN_TIP_CANON="${MIN_TIP#"${MIN_TIP%%[!0]*}"}"
   echo "==> Setting the minimum tip amount for ${SLUG} to ${MIN_TIP_CANON} smallest units"
   ARGS+=(--min_amount "${MIN_TIP_CANON}")
 fi

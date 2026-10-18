@@ -9,9 +9,9 @@ env:
   CARGO_TERM_COLOR: always
   # Pinned Stellar CLI used for release builds. Must match the major version
   # of soroban-sdk (workspace Cargo.toml) and is documented in RELEASING.md.
-  # The build itself runs `stellar contract build` + `stellar contract
-  # optimize`, exactly as scripts/deploy.sh does.
-  STELLAR_CLI_VERSION: "22.0.0"
+  # The build itself runs `stellar contract build --optimize`, exactly as
+  # scripts/deploy.sh does. Minimum supported CLI is 27.1.0 (#121).
+  STELLAR_CLI_VERSION: "27.1.0"
 
 permissions:
   contents: write
@@ -45,19 +45,12 @@ jobs:
           echo "RELEASE_VERSION=$TAG" >> "$GITHUB_ENV"
 
       - name: Build contract
-        run: stellar contract build
+        run: stellar contract build --optimize
 
-      - name: Optimize wasm
+      - name: Prepare release artifact
         run: |
-          WASM="$(find target -name 'tip_splitter.wasm' -path '*release*' -not -path '*/deps/*' \
-                  -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
-          if [ -z "${WASM}" ] || [ ! -f "${WASM}" ]; then
-            echo "error: no built tip_splitter.wasm found under target/." >&2
-            exit 1
-          fi
-          stellar contract optimize --wasm "${WASM}"
-          OPTIMIZED="${WASM%.wasm}.optimized.wasm"
-          cp "${OPTIMIZED}" tip_splitter.optimized.wasm
+          WASM="$(./scripts/find-wasm.sh)"
+          cp "${WASM}" tip_splitter.optimized.wasm
           sha256sum tip_splitter.optimized.wasm | awk '{print $1}' > tip_splitter.optimized.wasm.sha256
           echo "SHA-256: $(cat tip_splitter.optimized.wasm.sha256)"
           echo "OPTIMIZED_WASM=tip_splitter.optimized.wasm" >> "$GITHUB_ENV"
