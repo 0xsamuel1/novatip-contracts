@@ -258,6 +258,10 @@ pub enum DataKey {
     Registrar,
 }
 
+/// Public error codes. The numbers are part of the client interface —
+/// `novatip-sdk` and the frontend map them to user-facing messages — so they
+/// are pinned by `error_codes_are_pinned_to_the_public_interface` in
+/// `src/test.rs`. Append new variants; never renumber an existing one.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
