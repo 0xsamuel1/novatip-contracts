@@ -128,6 +128,21 @@ pub struct Jar {
     pub locked: bool,
 }
 
+/// Versioned storage envelope. New fields must be added as a new variant so
+/// older jars remain decodable during a rolling deployment.
+#[contracttype]
+#[derive(Clone)]
+pub enum JarRecord {
+    V1(Jar),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewSplit {
+    pub to: Address,
+    pub amount: i128,
+}
+
 /// A jar's settled tip totals, kept on-chain next to the jar.
 ///
 /// Every figure a creator sees normally comes from the backend indexer's
@@ -1689,6 +1704,21 @@ impl TipSplitter {
         Self::compute_shares(&env, &jar.splits, amount)
     }
 
+    /// Return the preview together with each recipient, avoiding a second
+    /// `get_jar` round trip for clients that need to render the breakdown.
+    pub fn preview_split_details(env: Env, jar_id: String, amount: i128) -> Vec<PreviewSplit> {
+        let key = DataKey::Jar(jar_id.clone());
+        let jar: Jar = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+        env.storage().persistent().extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        let amounts = Self::compute_shares(&env, &jar.splits, amount);
+        let mut result = Vec::new(&env);
+        for i in 0..amounts.len() {
+            result.push_back(PreviewSplit { to: jar.splits.get(i).unwrap().to, amount: amounts.get(i).unwrap() });
+        }
+        result
+    }
+
     /// What each recipient would *actually receive* from a `tip` of `amount`
     /// sent by `from`, in split order — the sender-aware version of
     /// [`Self::preview_split`] (#177).
@@ -1882,6 +1912,7 @@ impl TipSplitter {
     /// returns a plain `bool` and reads one storage key, so the onboarding form
     /// can run it on every (debounced) keystroke.
     pub fn jar_exists(env: Env, jar_id: String) -> bool {
+        if jar_id.is_empty() || jar_id.len() > MAX_JAR_ID_LEN { return false; }
         env.storage().persistent().has(&DataKey::Jar(jar_id))
     }
 
@@ -2035,10 +2066,10 @@ impl TipSplitter {
             let share = if i == n - 1 {
                 amount - distributed
             } else {
-                amount
-                    .checked_mul(splits.get(i).unwrap().bps as i128)
-                    .unwrap_or_else(|| panic_with_error!(env, Error::InvalidAmount))
-                    / denom
+                let product = amount.checked_mul(splits.get(i).unwrap().bps as i128)
+                    .unwrap_or_else(|| panic_with_error!(env, Error::InvalidAmount));
+                if product < denom { panic_with_error!(env, Error::InvalidAmount); }
+                product / denom
             };
             distributed += share;
             shares.push_back(share);
