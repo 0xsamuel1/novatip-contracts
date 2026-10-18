@@ -19,6 +19,7 @@ See [`docs/CONTRACT.md`](./docs/CONTRACT.md) for the full `tip-splitter` interfa
 ## Quick start
 
 ```bash
+# Requires Stellar CLI 27.1.0 or newer (`stellar version`)
 # One-time: the Stellar CLI builds contracts for this target
 rustup target add wasm32v1-none
 
@@ -38,14 +39,14 @@ make test
 Everything under [`scripts/`](./scripts) reads the same environment variables
 (see [`.env.example`](./.env.example)) and signs with a configured Stellar CLI
 identity. `CONTRACT_ID` is optional for every script that needs it: it falls
-back to the `.contract-id` file `deploy.sh` writes.
+back to the `.contract-id.<NETWORK>` file `deploy.sh` writes.
 
 Load your environment once per shell, then run whichever script you need:
 
 ```bash
 set -a; source .env; set +a
 
-./scripts/deploy.sh          # build, optimize, deploy; writes .contract-id
+./scripts/deploy.sh          # build (optimized), deploy; writes .contract-id.<NETWORK>
 ./scripts/create-jar.sh      # register a jar (RECIPIENT or SPLITS)
 ./scripts/transfer-jar.sh    # hand a jar to NEW_OWNER
 ./scripts/set-min-tip.sh     # set a jar's minimum tip, or clear it
@@ -53,7 +54,7 @@ set -a; source .env; set +a
 
 | Script | Needs | Notes |
 |--------|-------|-------|
-| `deploy.sh` | `NETWORK`, `SOURCE`, `ADMIN`, `USDC_TOKEN` | Prints and saves the deployed contract id |
+| `deploy.sh` | `NETWORK`, `SOURCE`, `ADMIN`, `USDC_TOKEN` | Prints and saves the deployed contract id to `.contract-id.<NETWORK>` |
 | `create-jar.sh` | `NETWORK`, `SOURCE`, `OWNER`, `SLUG`, and `RECIPIENT` or `SPLITS` | `SPLITS` is validated locally (1–20 recipients, bps summing to 10000) before any call |
 | `transfer-jar.sh` | `NETWORK`, `SOURCE`, `SLUG`, `NEW_OWNER` | Reads and prints the jar's current owner first, so a wrong `SOURCE` or contract is visible before the hand-over |
 | `set-min-tip.sh` | `NETWORK`, `SOURCE`, `SLUG`, and optionally `MIN_TIP` | `MIN_TIP` is a positive integer in the token's smallest unit. Unset or `none` **clears** the minimum — which means invoking without the `--min_amount` flag at all, the only way to send `Option::None`. Zero, negative and non-numeric values are rejected locally |
@@ -64,7 +65,7 @@ on success and clearing a jar that already had no floor is a silent no-op.
 ## Tech
 
 - [Rust](https://www.rust-lang.org/) + [Soroban SDK](https://developers.stellar.org/docs/build/smart-contracts)
-- [Stellar CLI](https://developers.stellar.org/docs/tools/cli) for build & deploy
+- [Stellar CLI](https://developers.stellar.org/docs/tools/cli) 27.1.0+ for build & deploy
 - Tips settle in **USDC** (Stellar Asset Contract)
 
 ## Network Deployments

@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Required env (see .env.example):
 #   NETWORK, SOURCE, SLUG
-#   CONTRACT_ID  (optional; defaults to the contents of .contract-id)
+#   CONTRACT_ID  (optional; defaults to .contract-id.<NETWORK>)
 #   SPLITS or RECIPIENT  the new splits, same format as create-jar.sh
 #
 # SOURCE signs the transaction and must be the jar's owner: update_splits
@@ -25,7 +25,7 @@ set -euo pipefail
 . "${NOVATIP_ROOT}/scripts/lib/splits.sh"
 
 require_env NETWORK SOURCE SLUG
-CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+require_contract_id
 
 resolve_splits || exit 1
 

@@ -8,7 +8,7 @@ set -euo pipefail
 #   SOURCE       Stellar CLI identity used to sign (must be the current owner)
 #   SLUG         the jar's public id, e.g. @alice
 #   NEW_OWNER    G... address taking control of the jar
-#   CONTRACT_ID  optional; defaults to the contents of .contract-id
+#   CONTRACT_ID  optional; defaults to .contract-id.<NETWORK>
 #
 # Usage:  set -a; source .env; set +a; ./scripts/transfer-jar.sh
 #         NEW_OWNER=GB7T... ./scripts/transfer-jar.sh
@@ -24,7 +24,7 @@ set -euo pipefail
 : "${SOURCE:?set SOURCE}"
 : "${SLUG:?set SLUG}"
 : "${NEW_OWNER:?set NEW_OWNER}"
-CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+require_contract_id
 
 # Show who controls the jar before the call, so an operator driving the wrong
 # SOURCE, or pointing at the wrong deployed contract, sees it here rather than

@@ -6,28 +6,26 @@
 # Build all contracts to wasm (requires the Stellar CLI).
 # Embeds source repo and commit in the wasm metadata (#127).
 build:
+	@./scripts/check-stellar-cli.sh
 	@REPO="github:Novatip/novatip-contracts"; \
 	COMMIT=$$(git rev-parse --short HEAD 2>/dev/null || echo "unknown"); \
 	DIRTY=""; \
 	if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then DIRTY="-dirty"; fi; \
-	stellar contract build \
+	stellar contract build --optimize \
 		--meta source_repo=$$REPO \
 		--meta source_commit=$$COMMIT$$DIRTY
 
-# Optimize the built tip_splitter wasm and print the before/after size.
-# Run `make build` first.
-optimize:
-	@WASM=$$(find target -name 'tip_splitter.wasm' -path '*release*' -not -path '*/deps/*' \
-		-printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-); \
+# `stellar contract build --optimize` already produces the optimized artifact,
+# so this target just builds and reports its size (#121). Kept as an alias for
+# existing workflows.
+optimize: build
+	@WASM=$$(./scripts/find-wasm.sh || true); \
 	if [ -z "$$WASM" ] || [ ! -f "$$WASM" ]; then \
 		echo "error: no built tip_splitter.wasm found under target/. Run 'make build' first." >&2; \
 		exit 1; \
 	fi; \
-	BEFORE=$$(wc -c < "$$WASM"); \
-	stellar contract optimize --wasm "$$WASM"; \
-	OPTIMIZED="$${WASM%.wasm}.optimized.wasm"; \
-	AFTER=$$(wc -c < "$$OPTIMIZED"); \
-	echo "==> $$OPTIMIZED: $$BEFORE -> $$AFTER bytes ($$((BEFORE - AFTER)) saved)"
+	SIZE=$$(wc -c < "$$WASM"); \
+	echo "==> $$WASM: $$SIZE bytes (optimized by stellar contract build)"
 
 # Run the test suite.
 test:

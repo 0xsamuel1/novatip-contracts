@@ -54,9 +54,9 @@ The crate version lives in `contracts/tip-splitter/Cargo.toml` (currently
    triggers `.github/workflows/release.yml`, which checks the tag against
    the crate version, builds with the pinned toolchain (**Rust 1.84.0**,
    per `rust-toolchain.toml`) and the pinned Stellar CLI
-   (**22.0.0**, `STELLAR_CLI_VERSION` in the workflow) exactly as
-   `scripts/deploy.sh` does (`stellar contract build`, then
-   `stellar contract optimize`), and creates a GitHub release holding:
+   (**27.1.0**, `STELLAR_CLI_VERSION` in the workflow) exactly as
+   `scripts/deploy.sh` does (`stellar contract build --optimize`), and creates
+   a GitHub release holding:
    - the optimized wasm (`tip_splitter.optimized.wasm`),
    - its SHA-256 (`tip_splitter.optimized.wasm.sha256`),
    - the contract interface spec (`interface.json`),

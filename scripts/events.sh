@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+. "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
+
 # List events published by a deployed tip_splitter contract, with the topic
 # filters computed correctly instead of hand-encoded.
 #
@@ -13,7 +15,7 @@ set -euo pipefail
 #
 # Required env:
 #   NETWORK      testnet | mainnet | local
-#   CONTRACT_ID  optional; defaults to the contents of .contract-id
+#   CONTRACT_ID  optional; defaults to .contract-id.<NETWORK>
 #
 # Optional env:
 #   EVENT          one of jar_crtd | splits | jar_xfer | min_tip | tip | all
@@ -29,7 +31,7 @@ set -euo pipefail
 #         ./scripts/events.sh                          # every event, all jars
 #         EVENT=tip SLUG=@demo ./scripts/events.sh     # tips to one jar
 #
-# Sample session (testnet, contract from .contract-id, jar "@demo"):
+# Sample session (testnet, contract from .contract-id.<NETWORK>, jar "@demo"):
 #
 #   $ EVENT=tip SLUG=@demo ./scripts/events.sh
 #   ==> ledger 4 512 104  tip  @demo  from=GBSG...ZTTQEVFL amount=2 500 000
@@ -46,7 +48,7 @@ set -euo pipefail
 # error through.
 
 : "${NETWORK:?set NETWORK (testnet | mainnet | local)}"
-CONTRACT_ID="${CONTRACT_ID:-$(cat .contract-id)}"
+require_contract_id
 EVENT="${EVENT:-all}"
 WINDOW="${WINDOW:-10000}"
 

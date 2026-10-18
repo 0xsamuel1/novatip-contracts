@@ -8,21 +8,18 @@ set -euo pipefail
 #
 # Usage:  ./scripts/verify-deployment.sh [CONTRACT_ID]
 #
-# If CONTRACT_ID is omitted, reads `.contract-id` (written by deploy.sh).
+# If CONTRACT_ID is omitted, reads `.contract-id.<NETWORK>` (written by deploy.sh).
 # Requires: NETWORK env var (testnet | mainnet | local), stellar CLI, sha256sum.
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
+. "${NOVATIP_ROOT}/scripts/lib/cli.sh"
 
 require_env NETWORK
+require_stellar_cli
 
 CONTRACT_ID="${1:-}"
 if [ -z "${CONTRACT_ID}" ]; then
-  if [ -f .contract-id ]; then
-    CONTRACT_ID=$(cat .contract-id)
-  else
-    echo "error: no CONTRACT_ID argument and no .contract-id file found" >&2
-    exit 1
-  fi
+  require_contract_id
 fi
 
 echo "==> Verifying deployment ${CONTRACT_ID} on ${NETWORK}"
@@ -42,10 +39,9 @@ echo "    Deployed SHA-256: ${DEPLOYED_HASH}"
 
 # ── Build locally (same as deploy.sh) ───────────────────────────────────────
 echo "==> Building local wasm"
-stellar contract build
+stellar contract build --optimize
 
-LOCAL_WASM="$(find target -name 'tip_splitter.wasm' -path '*release*' -not -path '*/deps/*' \
-        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+LOCAL_WASM="$(./scripts/find-wasm.sh || true)"
 
 if [ -z "${LOCAL_WASM}" ] || [ ! -f "${LOCAL_WASM}" ]; then
   echo "error: no built tip_splitter.wasm found under target/." >&2
@@ -90,11 +86,11 @@ if [ -n "${DEPLOYED_IFACE}" ] && [ -n "${LOCAL_IFACE}" ]; then
 
   if [ -n "${ONLY_LOCAL}" ]; then
     echo "  Functions in local but NOT deployed:"
-    echo "${ONLY_LOCAL}" | sed 's/^/    + /'
+    echo "${ONLY_LOCAL}" | awk '{ print "    + " $0 }'
   fi
   if [ -n "${ONLY_DEPLOYED}" ]; then
     echo "  Functions in deployed but NOT local:"
-    echo "${ONLY_DEPLOYED}" | sed 's/^/    - /'
+    echo "${ONLY_DEPLOYED}" | awk '{ print "    - " $0 }'
   fi
   if [ -z "${ONLY_LOCAL}" ] && [ -z "${ONLY_DEPLOYED}" ]; then
     echo "  Interfaces match (same function set)."
