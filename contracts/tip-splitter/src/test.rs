@@ -3415,11 +3415,8 @@ proptest! {
 
     /// The core invariant: however a tip is split, every recipient's payout
     /// sums back to exactly the tipped amount, with no dust lost or created,
-    /// and the tipper's balance drops by exactly that amount.
-    ///
-    /// Draws amounts from the smallest accepted value upward (biased toward
-    /// the boundary), so truncation effects are exercised. Amounts below
-    /// the minimum are covered by `tip_rejects_small_amounts` below.
+    /// and the tipper's balance drops by exactly that amount. Covers amounts
+    /// smaller than the recipient count, where truncation bites hardest.
     #[test]
     fn tip_distributes_full_amount_across_random_splits(
         bps in splits_strategy(),
@@ -4453,306 +4450,6 @@ fn tip_writes_the_two_totals_entries() {
 
     let jar_id = String::from_str(env, "@budget");
     client.create_jar(
-// ── Issue #136: small amounts are rejected, not silently mis-split ──────────
-
-/// Asserts that amounts below the minimum accepted value fail with
-/// \`InvalidAmount\` and leave every balance unchanged. The minimum is
-/// \`ceil(BPS_DENOM / min_bps)\` for the generated splits — below that,
-/// some recipient's share would truncate to zero.
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
-    #[test]
-    fn tip_rejects_small_amounts(
-        bps in splits_strategy(),
-        small in 1i128..=20i128,
-    ) {
-        let s = setup();
-        let env = &s.env;
-        let client = TipSplitterClient::new(env, &s.contract);
-        let token = token::Client::new(env, &s.token);
-        let token_admin = token::StellarAssetClient::new(env, &s.token);
-
-        let owner = Address::generate(env);
-        let tipper = Address::generate(env);
-        token_admin.mint(&tipper, &small);
-
-        let recipients: std::vec::Vec<Address> =
-            bps.iter().map(|_| Address::generate(env)).collect();
-        let mut splits = vec![env];
-        for (addr, b) in recipients.iter().zip(bps.iter()) {
-            splits.push_back(Split { to: addr.clone(), bps: *b });
-        }
-
-        let jar_id = String::from_str(env, "@small");
-        client.create_jar(&owner, &jar_id, &splits);
-
-        // Record balances before
-        let tipper_before = token.balance(&tipper);
-        let mut balances_before = std::vec::Vec::new();
-        for r in recipients.iter() {
-            balances_before.push(token.balance(r));
-        }
-
-        let result = client.try_tip(&tipper, &jar_id, &small, &String::from_str(env, "x"));
-
-        // Must fail with InvalidAmount
-        prop_assert!(result.is_err());
-
-        // No balance changed
-        prop_assert_eq!(token.balance(&tipper), tipper_before);
-        for (r, before) in recipients.iter().zip(balances_before.iter()) {
-            prop_assert_eq!(token.balance(r), *before);
-        }
-    }
-}
-
-// ── Issue #137: validate_splits against a reference model ────────────────────
-
-/// Reference model of the validation rules, written from docs/CONTRACT.md.
-/// Check order (matches the contract):
-///   1. splits is not empty           → SplitsEmpty
-///   2. length <= MAX_RECIPIENTS      → TooManyRecipients
-///   3. every bps in 1..=BPS_DENOM    → SplitOutOfRange
-///   4. no duplicate recipients       → DuplicateRecipient
-///   5. bps sum == BPS_DENOM          → SplitSumNot100Pct
-///   6. success
-#[derive(Debug, PartialEq)]
-enum ModelError {
-    SplitsEmpty,
-    TooManyRecipients,
-    SplitOutOfRange,
-    DuplicateRecipient,
-    SplitSumNot100Pct,
-}
-
-fn model_validate_splits(splits: &std::vec::Vec<(u32, u8)>) -> Result<(), ModelError> {
-    const MAX_RECIPIENTS: usize = 10;
-    const BPS_DENOM: u32 = 10_000;
-    if splits.is_empty() {
-        return Err(ModelError::SplitsEmpty);
-    }
-    if splits.len() > MAX_RECIPIENTS {
-        return Err(ModelError::TooManyRecipients);
-    }
-    for (_, bps) in splits {
-        if *bps == 0 || *bps > BPS_DENOM as u8 {
-            return Err(ModelError::SplitOutOfRange);
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    for (idx, _) in splits {
-        if !seen.insert(*idx) {
-            return Err(ModelError::DuplicateRecipient);
-        }
-    }
-    let sum: u32 = splits.iter().map(|(_, b)| *b as u32).sum();
-    if sum != BPS_DENOM {
-        return Err(ModelError::SplitSumNot100Pct);
-    }
-    Ok(())
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
-    /// Compares \`try_create_jar\` against the reference model across
-    /// generated vectors that combine several defects (duplicates, out-of-range
-    /// bps, wrong sums). Also verifies that a rejected create leaves no jar.
-    #[test]
-    fn validate_splits_matches_reference_model(
-        splits in proptest::collection::vec(
-            (0u8..5u8, proptest::sample::select(std::vec![0u32, 1, 5000, 9999, 10_000, 10_001])),
-            0..12usize
-        ),
-    ) {
-        let s = setup();
-        let env = &s.env;
-        let client = TipSplitterClient::new(env, &s.contract);
-
-        let owner = Address::generate(env);
-        let jar_id = String::from_str(env, "@model");
-
-        // Build the Soroban Vec<Split> from the generated data
-        let mut sb_splits = vec![env];
-        for (idx, bps) in splits.iter() {
-            // Use a fixed pool of addresses so duplicates are common
-            let addr = match idx % 4 {
-                0 => Address::from_string(env, &String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")),
-                1 => Address::from_string(env, &String::from_str(env, "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")),
-                2 => Address::from_string(env, &String::from_str(env, "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")),
-                _ => Address::from_string(env, &String::from_str(env, "GDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD")),
-            };
-            sb_splits.push_back(Split { to: addr, bps: *bps });
-        }
-
-        let expected = model_validate_splits(&splits);
-        let result = client.try_create_jar(&owner, &jar_id, &sb_splits);
-
-        match expected {
-            Ok(()) => {
-                prop_assert!(result.is_ok());
-                prop_assert!(client.jar_exists(&jar_id));
-            }
-            Err(_) => {
-                prop_assert!(result.is_err());
-                prop_assert!(!client.jar_exists(&jar_id));
-            }
-        }
-    }
-}
-
-// ── Issue #138: preview_split matches tip across random jars ────────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
-    /// Asserts that preview_split, the tip event breakdown, and balance
-    /// changes all agree recipient-by-recipient for random jars and amounts.
-    /// Also asserts preview and tip succeed or fail together with the same error.
-    #[test]
-    fn preview_split_matches_tip_across_random_jars(
-        bps in splits_strategy(),
-        amount in 1i128..=10_000_000i128,
-    ) {
-        let s = setup();
-        let env = &s.env;
-        let client = TipSplitterClient::new(env, &s.contract);
-        let token = token::Client::new(env, &s.token);
-        let token_admin = token::StellarAssetClient::new(env, &s.token);
-
-        let owner = Address::generate(env);
-        let tipper = Address::generate(env);
-        token_admin.mint(&tipper, &10_000_000i128);
-
-        let recipients: std::vec::Vec<Address> =
-            bps.iter().map(|_| Address::generate(env)).collect();
-        let mut splits = vec![env];
-        for (addr, b) in recipients.iter().zip(bps.iter()) {
-            splits.push_back(Split { to: addr.clone(), bps: *b });
-        }
-
-        let jar_id = String::from_str(env, "@preview");
-        client.create_jar(&owner, &jar_id, &splits);
-
-        // Record balances before
-        let mut balances_before = std::vec::Vec::new();
-        for r in recipients.iter() {
-            balances_before.push(token.balance(r));
-        }
-
-        // Try preview and tip — they must agree on success/failure
-        let preview_result = client.try_preview_split(&jar_id, &amount);
-        let tip_result = client.try_tip(&tipper, &jar_id, &amount, &String::from_str(env, "x"));
-
-        prop_assert_eq!(preview_result.is_ok(), tip_result.is_ok());
-
-        if preview_result.is_ok() && tip_result.is_ok() {
-            let preview_shares = preview_result.unwrap().unwrap();
-            // Check that each recipient's balance increased by the previewed share
-            for (i, r) in recipients.iter().enumerate() {
-                let expected_share = preview_shares.get(i as u32).unwrap();
-                let actual_balance = token.balance(r);
-                prop_assert_eq!(actual_balance - balances_before[i], expected_share);
-            }
-        }
-    }
-// ── #139: Model-based property test ──────────────────────────────────────────
-
-use proptest::prelude::*;
-
-#[derive(Debug, Clone)]
-enum Op {
-    CreateJar { slug: String, owner_idx: usize, recipients: Vec<(usize, u32)> },
-    UpdateSplits { slug: String, recipients: Vec<(usize, u32)> },
-    TransferOwnership { slug: String, new_owner_idx: usize },
-    SetMinTip { slug: String, amount: Option<i128> },
-    Tip { slug: String, tipper_idx: usize, amount: i128 },
-}
-
-fn op_strategy() -> impl Strategy<Value = Op> {
-    let slugs = prop::sample::select(vec!["@a", "@b", "@c"].map(String::from));
-    let addr_idx = 0..4usize;
-    prop_oneof![
-        (slugs.clone(), addr_idx.clone(), prop::collection::vec((addr_idx.clone(), 1..10000u32), 1..3))
-            .prop_map(|(slug, owner_idx, recipients)| Op::CreateJar { slug, owner_idx, recipients }),
-        (slugs.clone(), prop::collection::vec((addr_idx.clone(), 1..10000u32), 1..3))
-            .prop_map(|(slug, recipients)| Op::UpdateSplits { slug, recipients }),
-        (slugs.clone(), addr_idx.clone())
-            .prop_map(|(slug, new_owner_idx)| Op::TransferOwnership { slug, new_owner_idx }),
-        (slugs.clone(), prop::option::of(0..1000i128))
-            .prop_map(|(slug, amount)| Op::SetMinTip { slug, amount }),
-        (slugs.clone(), addr_idx.clone(), 1..1000i128)
-            .prop_map(|(slug, tipper_idx, amount)| Op::Tip { slug, tipper_idx, amount }),
-    ]
-}
-
-proptest! {
-    #[test]
-    fn model_based_property_test(ops in proptest::collection::vec(op_strategy(), 20..50)) {
-        let s = setup();
-        let env = &s.env;
-        let client = TipSplitterClient::new(env, &s.contract);
-        let token_admin = token::StellarAssetClient::new(env, &s.token);
-        let token = token::Client::new(env, &s.token);
-
-        let addresses: Vec<Address> = (0..4).map(|_| Address::generate(env)).collect();
-        let mut model_jars: std::collections::HashMap<String, Vec<(usize, u32)>> = std::collections::HashMap::new();
-        let mut model_mins: std::collections::HashMap<String, Option<i128>> = std::collections::HashMap::new();
-        let mut total_supply: i128 = 0;
-
-        for op in &ops {
-            match op {
-                Op::CreateJar { slug, owner_idx, recipients } => {
-                    let jar_id = String::from_str(env, slug);
-                    let splits: Vec<Split> = recipients.iter().map(|(i, bps)| Split {
-                        to: addresses[*i].clone(),
-                        bps: *bps,
-                    }).collect();
-                    let splits_vec = vec![env, ...splits];
-                    let res = client.try_create_jar(&addresses[*owner_idx], &jar_id, &splits_vec);
-                    let sum: u32 = recipients.iter().map(|(_, b)| b).sum();
-                    if sum != 10000 || model_jars.contains_key(slug) {
-                        prop_assert!(res.is_err());
-                    } else {
-                        prop_assert!(res.is_ok());
-                        model_jars.insert(slug.clone(), recipients.clone());
-                    }
-                }
-                Op::Tip { slug, tipper_idx, amount } => {
-                    if !model_jars.contains_key(slug) {
-                        continue;
-                    }
-                    let jar_id = String::from_str(env, slug);
-                    let res = client.try_tip(&addresses[*tipper_idx], &jar_id, &amount, &String::from_str(env, "tip"));
-                    // Balance checks: contract vs model
-                    let contract_balance = token.balance(&addresses[*tipper_idx]);
-                    prop_assert!(contract_balance >= 0);
-                    total_supply += *amount; // simplified model
-                }
-                _ => {} // Other ops handled by contract directly
-            }
-        }
-
-        // Total supply must be unchanged (simplified check)
-        prop_assert!(total_supply >= 0);
-    }
-}
-
-// ── #140: Assert specific errors instead of is_err ──────────────────────────
-
-#[test]
-fn jar_exists_is_false_for_rejected_jar_exact_error() {
-    let s = setup();
-    let env = &s.env;
-    let client = TipSplitterClient::new(env, &s.contract);
-    let owner = Address::generate(env);
-    let alice = Address::generate(env);
-    let bob = Address::generate(env);
-    let jar_id = String::from_str(env, "@rejected-exact");
-
-    // 6000 + 3000 = 9000, so the jar is never stored.
-    let res = client.try_create_jar(
         &owner,
         &jar_id,
         &vec![
@@ -5093,86 +4790,6 @@ fn tip_in_token_rejects_a_disallowed_token_before_funds_move() {
 
     let jar_id = String::from_str(env, "@closed");
     client.create_jar(
-            Split { to: alice.clone(), bps: 6000 },
-            Split { to: bob.clone(), bps: 3000 },
-        ],
-    );
-    // #140 — assert the specific error, not just is_err()
-    assert_eq!(res, Err(Ok(Error::SplitSumNot100Pct.into())));
-}
-
-#[test]
-fn set_min_tip_amount_requires_owner_auth_exact_error() {
-    let s = setup();
-    let env = &s.env;
-    let client = TipSplitterClient::new(env, &s.contract);
-    let owner = Address::generate(env);
-    let alice = Address::generate(env);
-    let non_owner = Address::generate(env);
-    let jar_id = String::from_str(env, "@authcheck-exact");
-    client.create_jar(
-        &owner,
-        &jar_id,
-        &vec![env, Split { to: alice.clone(), bps: 10000 }],
-    );
-
-    // #140 — positive control: owner can set the min tip
-    client.set_min_tip_amount(&jar_id, &Some(50_i128));
-    assert_eq!(client.get_min_tip_amount(&jar_id), Some(50));
-
-    // #140 — negative: non-owner is refused with the exact auth error
-    env.mock_auths(&[MockAuth {
-        address: &non_owner,
-        invoke: &MockAuthInvoke {
-            contract: &s.contract,
-            fn_name: "set_min_tip_amount",
-            args: (jar_id.clone(), Some(100_i128)).into_val(env),
-            sub_invokes: &[],
-        },
-    }]);
-    let res = client.try_set_min_tip_amount(&jar_id, &Some(100_i128));
-    assert!(res.is_err(), "non-owner must be rejected");
-    // Auth errors surface as host errors under mock_auths
-    let _ = res.unwrap_err();
-}
-
-// ── #141: Assert exact authorization with env.auths() ───────────────────────
-
-#[test]
-fn create_jar_authorization_tree() {
-    let s = setup();
-    let env = &s.env;
-    let client = TipSplitterClient::new(env, &s.contract);
-    let owner = Address::generate(env);
-    let alice = Address::generate(env);
-    let jar_id = String::from_str(env, "@authtree");
-
-    client.mock_all_auths().create_jar(
-        &owner,
-        &jar_id,
-        &vec![env, Split { to: alice.clone(), bps: 10000 }],
-    );
-
-    let auths = env.auths();
-    prop_assert_eq!(auths.len(), 1, "create_jar must record exactly one authorization");
-    assert_eq!(auths[0].0, owner);
-}
-
-#[test]
-fn tip_authorization_tree_multi_recipient() {
-    let s = setup();
-    let env = &s.env;
-    let client = TipSplitterClient::new(env, &s.contract);
-    let token_admin = token::StellarAssetClient::new(env, &s.token);
-    let owner = Address::generate(env);
-    let alice = Address::generate(env);
-    let bob = Address::generate(env);
-    let tipper = Address::generate(env);
-    let jar_id = String::from_str(env, "@authtree-tip");
-
-    token_admin.mint(&tipper, &1000);
-
-    client.mock_all_auths().create_jar(
         &owner,
         &jar_id,
         &vec![
@@ -6010,72 +5627,6 @@ fn preview_tip_reports_zero_for_a_sender_who_is_the_last_recipient() {
 /// `tip` itself would reject.
 #[test]
 fn preview_tip_rejects_what_tip_rejects() {
-            Split { to: alice.clone(), bps: 5000 },
-            Split { to: bob.clone(), bps: 5000 },
-        ],
-    );
-
-    client.mock_all_auths().tip(&tipper, &jar_id, &100, &String::from_str(env, "tip"));
-
-    let auths = env.auths();
-    // #141 — assert the full authorization tree including nested token transfers
-    assert!(!auths.is_empty(), "tip must record at least the tipper's authorization");
-    assert_eq!(auths[0].0, tipper);
-}
-
-// ── #142: Resource cost assertions ──────────────────────────────────────────
-
-const MAX_INSTRUCTIONS_20_RECIPIENTS: u64 = 500_000_000; // headroom over measured
-const MAX_MEMORY_20_RECIPIENTS: u64 = 200_000_000;
-const MAX_LEDGER_READS_20_RECIPIENTS: u32 = 100;
-const MAX_LEDGER_WRITES_20_RECIPIENTS: u32 = 50;
-
-#[test]
-fn tip_cost_budget_20_recipients() {
-    let s = setup();
-    let env = &s.env;
-    let client = TipSplitterClient::new(env, &s.contract);
-    let token_admin = token::StellarAssetClient::new(env, &s.token);
-    let owner = Address::generate(env);
-    let tipper = Address::generate(env);
-    let jar_id = String::from_str(env, "@cost20");
-
-    token_admin.mint(&tipper, &1_000_000);
-
-    // Create a jar with 20 recipients (MAX_RECIPIENTS)
-    let splits: Vec<Split> = (0..20)
-        .map(|i| Split {
-            to: Address::generate(env),
-            bps: 500, // 500 * 20 = 10000
-        })
-        .collect();
-    client.mock_all_auths().create_jar(&owner, &jar_id, &vec![env, ...splits]);
-
-    env.budget().reset_default();
-    let before_cpu = env.budget().cpu_instruction_cost();
-    let before_mem = env.budget().memory_bytes_cost();
-
-    client.mock_all_auths().tip(&tipper, &jar_id, &100, &String::from_str(env, "max tip"));
-
-    let cpu_used = env.budget().cpu_instruction_cost() - before_cpu;
-    let mem_used = env.budget().memory_bytes_cost() - before_mem;
-
-    // #142 — print measured values for review
-    eprintln!("tip_20_recipients: cpu={cpu_used}, mem={mem_used}");
-
-    // #142 — assert against named limits with headroom
-    assert!(
-        cpu_used < MAX_INSTRUCTIONS_20_RECIPIENTS,
-        "CPU instructions grew: {cpu_used} >= {MAX_INSTRUCTIONS_20_RECIPIENTS}"
-    );
-    assert!(
-        mem_used < MAX_MEMORY_20_RECIPIENTS,
-        "Memory grew: {mem_used} >= {MAX_MEMORY_20_RECIPIENTS}"
-    );
-}
-
-#[test]
-fn tip_cost_budget_1_recipient() {
     let s = setup();
     let env = &s.env;
     let client = TipSplitterClient::new(env, &s.contract);
@@ -6389,6 +5940,550 @@ fn create_jar_is_unchanged_when_no_registrar_is_set() {
     let jar = client.get_jar(&jar_id);
     assert_eq!(jar.owner, owner);
 }
+
+// ── Issue #136: small amounts are rejected, not silently mis-split ──────────
+
+// Asserts that amounts below the minimum accepted value fail with
+// `InvalidAmount` and leave every balance unchanged. The minimum is
+// `ceil(BPS_DENOM / min_bps)` for the generated splits — below that,
+// some recipient's share would truncate to zero.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn tip_rejects_small_amounts(
+        bps in splits_strategy(),
+        small in 1i128..=20i128,
+    ) {
+        let s = setup();
+        let env = &s.env;
+        let client = TipSplitterClient::new(env, &s.contract);
+        let token = token::Client::new(env, &s.token);
+        let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+        let owner = Address::generate(env);
+        let tipper = Address::generate(env);
+        token_admin.mint(&tipper, &small);
+
+        let recipients: std::vec::Vec<Address> =
+            bps.iter().map(|_| Address::generate(env)).collect();
+        let mut splits = vec![env];
+        for (addr, b) in recipients.iter().zip(bps.iter()) {
+            splits.push_back(Split { to: addr.clone(), bps: *b });
+        }
+
+        let jar_id = String::from_str(env, "@small");
+        client.create_jar(&owner, &jar_id, &splits);
+
+        // Record balances before
+        let tipper_before = token.balance(&tipper);
+        let mut balances_before = std::vec::Vec::new();
+        for r in recipients.iter() {
+            balances_before.push(token.balance(r));
+        }
+
+        let result = client.try_tip(&tipper, &jar_id, &small, &String::from_str(env, "x"));
+
+        // A share truncates to zero exactly when amount * bps < BPS_DENOM for
+        // the smallest share. Only that case must be rejected.
+        let min_bps = *bps.iter().min().unwrap() as i128;
+        if small * min_bps < 10_000 {
+            prop_assert!(result.is_err(), "a zero-truncated share must be rejected");
+
+            // No balance changed
+            prop_assert_eq!(token.balance(&tipper), tipper_before);
+            for (r, before) in recipients.iter().zip(balances_before.iter()) {
+                prop_assert_eq!(token.balance(r), *before);
+            }
+        } else {
+            prop_assert!(result.is_ok());
+        }
+    }
+}
+
+// ── Issue #137: validate_splits against a reference model ────────────────────
+
+/// Reference model of the validation rules, written from docs/CONTRACT.md.
+/// Check order (matches the contract):
+///   1. splits is not empty           → SplitsEmpty
+///   2. length <= MAX_RECIPIENTS      → TooManyRecipients
+///   3. every bps in 1..=BPS_DENOM    → SplitOutOfRange
+///   4. no duplicate recipients       → DuplicateRecipient
+///   5. bps sum == BPS_DENOM          → SplitSumNot100Pct
+///   6. success
+#[derive(Debug, PartialEq)]
+enum ModelError {
+    SplitsEmpty,
+    TooManyRecipients,
+    SplitOutOfRange,
+    DuplicateRecipient,
+    SplitSumNot100Pct,
+}
+
+fn model_validate_splits(splits: &std::vec::Vec<(u8, u32)>) -> Result<(), ModelError> {
+    const MAX_RECIPIENTS: usize = 10;
+    const BPS_DENOM: u32 = 10_000;
+    if splits.is_empty() {
+        return Err(ModelError::SplitsEmpty);
+    }
+    if splits.len() > MAX_RECIPIENTS {
+        return Err(ModelError::TooManyRecipients);
+    }
+    for (_, bps) in splits {
+        if *bps == 0 || *bps > BPS_DENOM {
+            return Err(ModelError::SplitOutOfRange);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (idx, _) in splits {
+        if !seen.insert(*idx) {
+            return Err(ModelError::DuplicateRecipient);
+        }
+    }
+    let sum: u32 = splits.iter().map(|(_, b)| *b).sum();
+    if sum != BPS_DENOM {
+        return Err(ModelError::SplitSumNot100Pct);
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Compares \`try_create_jar\` against the reference model across
+    /// generated vectors that combine several defects (duplicates, out-of-range
+    /// bps, wrong sums). Also verifies that a rejected create leaves no jar.
+    #[test]
+    fn validate_splits_matches_reference_model(
+        splits in proptest::collection::vec(
+            (0u8..5u8, proptest::sample::select(std::vec![0u32, 1, 5000, 9999, 10_000, 10_001])),
+            0..12usize
+        ),
+    ) {
+        let s = setup();
+        let env = &s.env;
+        let client = TipSplitterClient::new(env, &s.contract);
+
+        let owner = Address::generate(env);
+        let jar_id = String::from_str(env, "@model");
+        let pool: std::vec::Vec<Address> = (0..4).map(|_| Address::generate(env)).collect();
+
+        // Build the Soroban Vec<Split> from the generated data
+        let mut sb_splits = vec![env];
+        for (idx, bps) in splits.iter() {
+            // Use a fixed pool of addresses so duplicates are common
+            let addr = pool[*idx as usize % 4].clone();
+            sb_splits.push_back(Split { to: addr, bps: *bps });
+        }
+
+        let expected = model_validate_splits(&splits);
+        let result = client.try_create_jar(&owner, &jar_id, &sb_splits);
+
+        match expected {
+            Ok(()) => {
+                prop_assert!(result.is_ok());
+                prop_assert!(client.jar_exists(&jar_id));
+            }
+            Err(_) => {
+                prop_assert!(result.is_err());
+                prop_assert!(!client.jar_exists(&jar_id));
+            }
+        }
+    }
+}
+
+// ── Issue #138: preview_split matches tip across random jars ────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Asserts that preview_split, the tip event breakdown, and balance
+    /// changes all agree recipient-by-recipient for random jars and amounts.
+    /// Also asserts preview and tip succeed or fail together with the same error.
+    #[test]
+    fn preview_split_matches_tip_across_random_jars(
+        bps in splits_strategy(),
+        amount in 1i128..=10_000_000i128,
+    ) {
+        let s = setup();
+        let env = &s.env;
+        let client = TipSplitterClient::new(env, &s.contract);
+        let token = token::Client::new(env, &s.token);
+        let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+        let owner = Address::generate(env);
+        let tipper = Address::generate(env);
+        token_admin.mint(&tipper, &10_000_000i128);
+
+        let recipients: std::vec::Vec<Address> =
+            bps.iter().map(|_| Address::generate(env)).collect();
+        let mut splits = vec![env];
+        for (addr, b) in recipients.iter().zip(bps.iter()) {
+            splits.push_back(Split { to: addr.clone(), bps: *b });
+        }
+
+        let jar_id = String::from_str(env, "@preview");
+        client.create_jar(&owner, &jar_id, &splits);
+
+        // Record balances before
+        let mut balances_before = std::vec::Vec::new();
+        for r in recipients.iter() {
+            balances_before.push(token.balance(r));
+        }
+
+        // Try preview and tip — they must agree on success/failure
+        let preview_result = client.try_preview_split(&jar_id, &amount);
+        let tip_result = client.try_tip(&tipper, &jar_id, &amount, &String::from_str(env, "x"));
+
+        prop_assert_eq!(preview_result.is_ok(), tip_result.is_ok());
+
+        if preview_result.is_ok() && tip_result.is_ok() {
+            let preview_shares = preview_result.unwrap().unwrap();
+            // Check that each recipient's balance increased by the previewed share
+            for (i, r) in recipients.iter().enumerate() {
+                let expected_share = preview_shares.get(i as u32).unwrap();
+                let actual_balance = token.balance(r);
+                prop_assert_eq!(actual_balance - balances_before[i], expected_share);
+            }
+        }
+    }
+}
+
+// ── #139: Model-based property test ──────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+enum Op {
+    CreateJar {
+        slug: std::string::String,
+        owner_idx: usize,
+        recipients: std::vec::Vec<(usize, u32)>,
+    },
+    Tip {
+        slug: std::string::String,
+        tipper_idx: usize,
+        amount: i128,
+    },
+}
+
+fn op_strategy() -> impl Strategy<Value = Op> {
+    let slugs = prop::sample::select(std::vec![
+        std::string::String::from("@a"),
+        std::string::String::from("@b"),
+        std::string::String::from("@c"),
+    ]);
+    let addr_idx = 0..4usize;
+    prop_oneof![
+        (
+            slugs.clone(),
+            addr_idx.clone(),
+            prop::collection::vec((addr_idx.clone(), 1..10000u32), 1..3)
+        )
+            .prop_map(|(slug, owner_idx, recipients)| Op::CreateJar {
+                slug,
+                owner_idx,
+                recipients
+            }),
+        (slugs.clone(), addr_idx.clone(), 1..1000i128).prop_map(|(slug, tipper_idx, amount)| {
+            Op::Tip {
+                slug,
+                tipper_idx,
+                amount,
+            }
+        },),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn model_based_property_test(ops in proptest::collection::vec(op_strategy(), 20..50)) {
+        let s = setup();
+        let env = &s.env;
+        let client = TipSplitterClient::new(env, &s.contract);
+        let token = token::Client::new(env, &s.token);
+        let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+        let addresses: std::vec::Vec<Address> = (0..4).map(|_| Address::generate(env)).collect();
+        for address in &addresses {
+            token_admin.mint(address, &1_000_000);
+        }
+
+        let mut model_jars: std::collections::HashMap<
+            std::string::String,
+            std::vec::Vec<(usize, u32)>,
+        > = std::collections::HashMap::new();
+
+        for op in &ops {
+            match op {
+                Op::CreateJar {
+                    slug,
+                    owner_idx,
+                    recipients,
+                } => {
+                    let jar_id = String::from_str(env, slug.as_str());
+                    let mut splits: Vec<Split> = vec![env];
+                    for (i, bps) in recipients.iter() {
+                        splits.push_back(Split {
+                            to: addresses[*i].clone(),
+                            bps: *bps,
+                        });
+                    }
+                    let res = client.try_create_jar(&addresses[*owner_idx], &jar_id, &splits);
+                    let mut seen = std::collections::HashSet::new();
+                    let unique = recipients.iter().all(|(i, _)| seen.insert(*i));
+                    let sum: u32 = recipients.iter().map(|(_, b)| *b).sum();
+                    if sum != 10000 || !unique || model_jars.contains_key(slug) {
+                        prop_assert!(res.is_err());
+                    } else {
+                        prop_assert!(res.is_ok());
+                        model_jars.insert(slug.clone(), recipients.clone());
+                    }
+                }
+                Op::Tip {
+                    slug,
+                    tipper_idx,
+                    amount,
+                } => {
+                    let jar_id = String::from_str(env, slug.as_str());
+                    if !model_jars.contains_key(slug) {
+                        prop_assert!(client
+                            .try_tip(
+                                &addresses[*tipper_idx],
+                                &jar_id,
+                                amount,
+                                &String::from_str(env, "tip")
+                            )
+                            .is_err());
+                        continue;
+                    }
+                    let before = token.balance(&s.contract);
+                    let res = client.try_tip(
+                        &addresses[*tipper_idx],
+                        &jar_id,
+                        amount,
+                        &String::from_str(env, "tip"),
+                    );
+                    if res.is_ok() {
+                        // The router never keeps a tip: a successful call pays
+                        // recipients directly.
+                        prop_assert_eq!(token.balance(&s.contract), before);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── #140: Assert specific errors instead of is_err ──────────────────────────
+
+#[test]
+fn jar_exists_is_false_for_rejected_jar_exact_error() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let jar_id = String::from_str(env, "@rejected-exact");
+
+    // 6000 + 3000 = 9000, so the jar is never stored.
+    let res = client.try_create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 6000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 3000,
+            },
+        ],
+    );
+    // #140 — assert the specific error, not just is_err()
+    assert_eq!(res, Err(Ok(Error::SplitSumNot100Pct.into())));
+}
+
+#[test]
+fn set_min_tip_amount_requires_owner_auth_exact_error() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let non_owner = Address::generate(env);
+    let jar_id = String::from_str(env, "@authcheck-exact");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    // #140 — positive control: owner can set the min tip
+    client.set_min_tip_amount(&jar_id, &Some(50_i128));
+    assert_eq!(client.get_min_tip_amount(&jar_id), Some(50));
+
+    // #140 — negative: non-owner is refused with the exact auth error
+    env.mock_auths(&[MockAuth {
+        address: &non_owner,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "set_min_tip_amount",
+            args: (jar_id.clone(), Some(100_i128)).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = client.try_set_min_tip_amount(&jar_id, &Some(100_i128));
+    assert!(res.is_err(), "non-owner must be rejected");
+    // Auth errors surface as host errors under mock_auths
+    let _ = res.unwrap_err();
+}
+
+// ── #141: Assert exact authorization with env.auths() ───────────────────────
+
+#[test]
+fn create_jar_authorization_tree() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let jar_id = String::from_str(env, "@authtree");
+
+    client.mock_all_auths().create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+
+    let auths = env.auths();
+    assert_eq!(
+        auths.len(),
+        1,
+        "create_jar must record exactly one authorization"
+    );
+    assert_eq!(auths[0].0, owner);
+}
+
+#[test]
+fn tip_authorization_tree_multi_recipient() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    let jar_id = String::from_str(env, "@authtree-tip");
+
+    token_admin.mint(&tipper, &1000);
+
+    client.mock_all_auths().create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 5000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 5000,
+            },
+        ],
+    );
+
+    client
+        .mock_all_auths()
+        .tip(&tipper, &jar_id, &100, &String::from_str(env, "tip"));
+
+    let auths = env.auths();
+    // #141 — assert the full authorization tree including nested token transfers
+    assert!(
+        !auths.is_empty(),
+        "tip must record at least the tipper's authorization"
+    );
+    assert_eq!(auths[0].0, tipper);
+}
+
+// ── #142: Resource cost assertions ──────────────────────────────────────────
+
+const MAX_INSTRUCTIONS_20_RECIPIENTS: u64 = 500_000_000; // headroom over measured
+const MAX_MEMORY_20_RECIPIENTS: u64 = 200_000_000;
+
+#[test]
+fn tip_cost_budget_20_recipients() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+    let owner = Address::generate(env);
+    let tipper = Address::generate(env);
+    let jar_id = String::from_str(env, "@cost20");
+
+    token_admin.mint(&tipper, &1_000_000);
+
+    // Create a jar with 20 recipients (MAX_RECIPIENTS)
+    let splits: std::vec::Vec<Split> = (0..20)
+        .map(|_| Split {
+            to: Address::generate(env),
+            bps: 500, // 500 * 20 = 10000
+        })
+        .collect();
+    let mut jar_splits: Vec<Split> = vec![env];
+    for split in splits {
+        jar_splits.push_back(split);
+    }
+    client
+        .mock_all_auths()
+        .create_jar(&owner, &jar_id, &jar_splits);
+
+    env.cost_estimate().budget().reset_default();
+    let before_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let before_mem = env.cost_estimate().budget().memory_bytes_cost();
+
+    client
+        .mock_all_auths()
+        .tip(&tipper, &jar_id, &100, &String::from_str(env, "max tip"));
+
+    let cpu_used = env.cost_estimate().budget().cpu_instruction_cost() - before_cpu;
+    let mem_used = env.cost_estimate().budget().memory_bytes_cost() - before_mem;
+
+    // #142 — print measured values for review
+    eprintln!("tip_20_recipients: cpu={cpu_used}, mem={mem_used}");
+
+    // #142 — assert against named limits with headroom
+    assert!(
+        cpu_used < MAX_INSTRUCTIONS_20_RECIPIENTS,
+        "CPU instructions grew: {cpu_used} >= {MAX_INSTRUCTIONS_20_RECIPIENTS}"
+    );
+    assert!(
+        mem_used < MAX_MEMORY_20_RECIPIENTS,
+        "Memory grew: {mem_used} >= {MAX_MEMORY_20_RECIPIENTS}"
+    );
+}
+
+#[test]
+fn tip_cost_budget_1_recipient() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
     let owner = Address::generate(env);
     let alice = Address::generate(env);
     let tipper = Address::generate(env);
@@ -6398,17 +6493,25 @@ fn create_jar_is_unchanged_when_no_registrar_is_set() {
     client.mock_all_auths().create_jar(
         &owner,
         &jar_id,
-        &vec![env, Split { to: alice.clone(), bps: 10000 }],
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
     );
 
-    env.budget().reset_default();
-    let before_cpu = env.budget().cpu_instruction_cost();
-    let before_mem = env.budget().memory_bytes_cost();
+    env.cost_estimate().budget().reset_default();
+    let before_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let before_mem = env.cost_estimate().budget().memory_bytes_cost();
 
-    client.mock_all_auths().tip(&tipper, &jar_id, &100, &String::from_str(env, "single tip"));
+    client
+        .mock_all_auths()
+        .tip(&tipper, &jar_id, &100, &String::from_str(env, "single tip"));
 
-    let cpu_used = env.budget().cpu_instruction_cost() - before_cpu;
-    let mem_used = env.budget().memory_bytes_cost() - before_mem;
+    let cpu_used = env.cost_estimate().budget().cpu_instruction_cost() - before_cpu;
+    let mem_used = env.cost_estimate().budget().memory_bytes_cost() - before_mem;
 
     eprintln!("tip_1_recipient: cpu={cpu_used}, mem={mem_used}");
 
@@ -6416,4 +6519,565 @@ fn create_jar_is_unchanged_when_no_registrar_is_set() {
         cpu_used < MAX_INSTRUCTIONS_20_RECIPIENTS / 20,
         "1-recipient tip CPU grew disproportionately: {cpu_used}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #115–#118 — regression coverage for error codes, the minimum tip, the
+// no-custody invariant, and isolation between jars.
+// ---------------------------------------------------------------------------
+
+/// Error numbers are the contract's public interface: `novatip-sdk` maps each
+/// number to a user-facing message and appends new variants without renumbering.
+/// A deliberate edit here is the only acceptable way to change one.
+#[test]
+fn error_codes_are_pinned_to_the_public_interface() {
+    let codes = [
+        (Error::NotInitialized, 1u32),
+        (Error::JarExists, 2),
+        (Error::JarNotFound, 3),
+        (Error::InvalidSplits, 4),
+        (Error::InvalidAmount, 5),
+        (Error::TooManyRecipients, 6),
+        (Error::DuplicateRecipient, 7),
+        (Error::MessageTooLong, 8),
+        (Error::InvalidJarId, 9),
+        (Error::SplitsEmpty, 10),
+        (Error::SplitOutOfRange, 11),
+        (Error::SplitSumNot100Pct, 12),
+        (Error::BelowMinTipAmount, 13),
+        (Error::NotRecipient, 14),
+        (Error::SoleRecipient, 15),
+        (Error::RecurringNotFound, 16),
+        (Error::InvalidPeriod, 17),
+        (Error::NothingHeld, 18),
+        (Error::TokenNotAllowed, 19),
+        (Error::CannotDisallowDefault, 20),
+        (Error::StatsOverflow, 21),
+        (Error::InsufficientBalance, 22),
+        (Error::NotDue, 23),
+        (Error::InsufficientAllowance, 24),
+    ];
+
+    for (variant, expected) in codes {
+        assert_eq!(
+            variant as u32, expected,
+            "error codes are part of the public interface: novatip-sdk and the frontend map them to messages, so changing a value is a breaking change — append new variants and never renumber existing ones"
+        );
+    }
+}
+
+/// `tip` is a router, not a custodian: every successful tip pays recipients
+/// directly, so the contract's token balance stays zero even when rounding
+/// dust exists or the tipper is also a recipient.
+#[test]
+fn tip_never_leaves_tokens_in_the_contract() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let carol = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &100_000);
+
+    let dust_jar = String::from_str(env, "@nocustody-dust");
+    client.create_jar(
+        &owner,
+        &dust_jar,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 3333,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 3333,
+            },
+            Split {
+                to: carol.clone(),
+                bps: 3334,
+            },
+        ],
+    );
+
+    let max_jar = String::from_str(env, "@nocustody-max");
+    let mut max_splits: Vec<Split> = vec![env];
+    for _ in 0..MAX_RECIPIENTS {
+        max_splits.push_back(Split {
+            to: Address::generate(env),
+            bps: 500,
+        });
+    }
+    client.create_jar(&owner, &max_jar, &max_splits);
+
+    let self_jar = String::from_str(env, "@nocustody-self");
+    client.create_jar(
+        &owner,
+        &self_jar,
+        &vec![
+            env,
+            Split {
+                to: tipper.clone(),
+                bps: 5000,
+            },
+            Split {
+                to: alice.clone(),
+                bps: 3000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 2000,
+            },
+        ],
+    );
+
+    let cases = std::vec![
+        (dust_jar, 10_001i128),
+        (max_jar, 10_000i128),
+        (self_jar, 10_000i128),
+    ];
+
+    for (jar_id, amount) in cases {
+        let before = token.balance(&tipper);
+        client.tip(
+            &tipper,
+            &jar_id,
+            &amount,
+            &String::from_str(env, "no custody"),
+        );
+
+        // Read the event before any other contract call replaces it in the
+        // test environment's event buffer.
+        let breakdown = tip_breakdown(env, &s.contract, &jar_id);
+        let moved: i128 = breakdown.iter().map(|(_, amount)| *amount).sum();
+        let after = token.balance(&tipper);
+
+        assert_eq!(
+            token.balance(&s.contract),
+            0,
+            "the contract must not retain any tokens after tipping {jar_id:?}"
+        );
+        assert_eq!(
+            before - after,
+            moved,
+            "the tipper must be debited exactly the sum of the tip event breakdown"
+        );
+    }
+}
+
+/// Two jars with the same owner and a shared recipient must never share state.
+#[test]
+fn jars_owned_by_the_same_address_are_isolated() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let new_owner = Address::generate(env);
+    let shared = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &10_000);
+
+    let jar_a = String::from_str(env, "@solo");
+    let jar_b = String::from_str(env, "@band");
+    client.create_jar(
+        &owner,
+        &jar_a,
+        &vec![
+            env,
+            Split {
+                to: shared.clone(),
+                bps: 6000,
+            },
+            Split {
+                to: alice.clone(),
+                bps: 4000,
+            },
+        ],
+    );
+    // The duplicate-recipient check is per jar, so this must be accepted.
+    client.create_jar(
+        &owner,
+        &jar_b,
+        &vec![
+            env,
+            Split {
+                to: shared.clone(),
+                bps: 3000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 7000,
+            },
+        ],
+    );
+    assert!(client.jar_exists(&jar_a));
+    assert!(client.jar_exists(&jar_b));
+
+    let jar_b_splits_before = client.get_jar(&jar_b).splits;
+    client.update_splits(
+        &jar_a,
+        &vec![
+            env,
+            Split {
+                to: shared.clone(),
+                bps: 5000,
+            },
+            Split {
+                to: alice.clone(),
+                bps: 5000,
+            },
+        ],
+    );
+    let jar_b_splits_after = client.get_jar(&jar_b).splits;
+    assert_eq!(jar_b_splits_after.len(), jar_b_splits_before.len());
+    for i in 0..jar_b_splits_before.len() {
+        let before = jar_b_splits_before.get(i).unwrap();
+        let after = jar_b_splits_after.get(i).unwrap();
+        assert_eq!(after.to, before.to, "jar B's recipients must not change");
+        assert_eq!(after.bps, before.bps, "jar B's shares must not change");
+    }
+
+    let jar_b_owner_before = client.get_jar(&jar_b).owner;
+    client.transfer_jar_ownership(&jar_a, &new_owner);
+    assert_eq!(client.get_jar(&jar_a).owner, new_owner);
+    assert_eq!(
+        client.get_jar(&jar_b).owner,
+        jar_b_owner_before,
+        "transferring jar A must not move jar B"
+    );
+
+    client.set_min_tip_amount(&jar_a, &Some(1_000_i128));
+    assert_eq!(client.get_min_tip_amount(&jar_b), None);
+    assert_eq!(
+        client.try_preview_split(&jar_a, &999_i128),
+        Err(Ok(Error::BelowMinTipAmount.into()))
+    );
+    assert!(client.try_preview_split(&jar_b, &999_i128).is_ok());
+    assert_eq!(
+        client.try_tip(&tipper, &jar_a, &999_i128, &String::from_str(env, "low")),
+        Err(Ok(Error::BelowMinTipAmount.into()))
+    );
+
+    let shared_before = token.balance(&shared);
+    let alice_before = token.balance(&alice);
+    let bob_before = token.balance(&bob);
+
+    client.tip(
+        &tipper,
+        &jar_b,
+        &1_000_i128,
+        &String::from_str(env, "band tip"),
+    );
+
+    assert_eq!(
+        token.balance(&shared),
+        shared_before + 300,
+        "the shared recipient gets exactly jar B's 30 % share"
+    );
+    assert_eq!(token.balance(&bob), bob_before + 700);
+    assert_eq!(
+        token.balance(&alice),
+        alice_before,
+        "jar A's recipient must not be paid by a jar B tip"
+    );
+}
+
+/// A minimum set on one jar must survive an unrelated `update_splits` and keep
+/// governing both `tip` and `preview_split`.
+#[test]
+fn minimum_survives_update_splits_and_still_governs_tip_and_preview() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &10_000);
+
+    let jar_id = String::from_str(env, "@min-update");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+    client.set_min_tip_amount(&jar_id, &Some(500_i128));
+    client.update_splits(
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 7000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 3000,
+            },
+        ],
+    );
+
+    assert_eq!(client.get_min_tip_amount(&jar_id), Some(500));
+    assert_eq!(
+        client.try_tip(&tipper, &jar_id, &499_i128, &String::from_str(env, "low")),
+        Err(Ok(Error::BelowMinTipAmount.into()))
+    );
+    assert_eq!(
+        client.try_preview_split(&jar_id, &499_i128),
+        Err(Ok(Error::BelowMinTipAmount.into()))
+    );
+
+    client.tip(&tipper, &jar_id, &500_i128, &String::from_str(env, "ok"));
+    assert_eq!(token.balance(&alice), 350);
+    assert_eq!(token.balance(&bob), 150);
+}
+
+/// After ownership moves, only the new owner can change or clear the minimum,
+/// and the old owner's attempt is rejected.
+#[test]
+fn transferred_jar_minimum_is_controlled_by_the_new_owner() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+
+    let owner = Address::generate(env);
+    let new_owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let jar_id = String::from_str(env, "@min-xfer");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+    client.set_min_tip_amount(&jar_id, &Some(500_i128));
+    client.transfer_jar_ownership(&jar_id, &new_owner);
+
+    let set_700 = (jar_id.clone(), Some(700_i128)).into_val(env);
+    env.mock_auths(&[MockAuth {
+        address: &new_owner,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "set_min_tip_amount",
+            args: set_700,
+            sub_invokes: &[],
+        },
+    }]);
+    client.set_min_tip_amount(&jar_id, &Some(700_i128));
+    assert_eq!(client.get_min_tip_amount(&jar_id), Some(700));
+
+    let set_100 = (jar_id.clone(), Some(100_i128)).into_val(env);
+    env.mock_auths(&[MockAuth {
+        address: &owner,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "set_min_tip_amount",
+            args: set_100,
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(
+        client
+            .try_set_min_tip_amount(&jar_id, &Some(100_i128))
+            .is_err(),
+        "the previous owner must not change the minimum"
+    );
+    assert_eq!(client.get_min_tip_amount(&jar_id), Some(700));
+
+    let clear = (jar_id.clone(), Option::<i128>::None).into_val(env);
+    env.mock_auths(&[MockAuth {
+        address: &new_owner,
+        invoke: &MockAuthInvoke {
+            contract: &s.contract,
+            fn_name: "set_min_tip_amount",
+            args: clear,
+            sub_invokes: &[],
+        },
+    }]);
+    client.set_min_tip_amount(&jar_id, &None);
+    assert_eq!(client.get_min_tip_amount(&jar_id), None);
+}
+
+/// A minimum below the share floor does not replace it: the 1 bps recipient
+/// still needs an amount large enough for their share to round to at least one
+/// unit. Both errors are named so a change to either rule fails clearly.
+#[test]
+fn minimum_does_not_lower_the_share_floor() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let dust = Address::generate(env);
+    let rest = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &20_000);
+
+    let jar_id = String::from_str(env, "@min-floor");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: dust.clone(),
+                bps: 1,
+            },
+            Split {
+                to: rest.clone(),
+                bps: 9999,
+            },
+        ],
+    );
+    client.set_min_tip_amount(&jar_id, &Some(100_i128));
+
+    assert_eq!(
+        client.try_tip(
+            &tipper,
+            &jar_id,
+            &99_i128,
+            &String::from_str(env, "below min")
+        ),
+        Err(Ok(Error::BelowMinTipAmount.into()))
+    );
+    assert_eq!(
+        client.try_tip(&tipper, &jar_id, &100_i128, &String::from_str(env, "floor")),
+        Err(Ok(Error::InvalidAmount.into()))
+    );
+    assert_eq!(
+        client.try_preview_split(&jar_id, &100_i128),
+        Err(Ok(Error::InvalidAmount.into()))
+    );
+
+    client.tip(
+        &tipper,
+        &jar_id,
+        &10_000_i128,
+        &String::from_str(env, "clears floor"),
+    );
+    assert_eq!(token.balance(&dust), 1);
+    assert_eq!(token.balance(&rest), 9_999);
+}
+
+/// Clearing a minimum publishes `None` in the `min_tip` event, and a tip below
+/// the old floor then succeeds.
+#[test]
+fn clearing_minimum_publishes_none_and_allows_a_smaller_tip() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &1_000);
+
+    let jar_id = String::from_str(env, "@min-clear");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 10000,
+            },
+        ],
+    );
+    client.set_min_tip_amount(&jar_id, &Some(500_i128));
+    client.set_min_tip_amount(&jar_id, &None);
+
+    let topics = vec![
+        env,
+        symbol_short!("min_tip").into_val(env),
+        jar_id.clone().into_val(env),
+    ];
+    let events: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.contract && e.1 == topics)
+        .collect();
+    assert_eq!(events.len(), 1);
+    let (_, _, data) = events.first().unwrap();
+    let decoded: Option<i128> = TryFromVal::try_from_val(env, data).expect("min_tip event data");
+    assert_eq!(decoded, None);
+
+    client.tip(&tipper, &jar_id, &100_i128, &String::from_str(env, "small"));
+    assert_eq!(token.balance(&alice), 100);
+}
+
+/// A rejection on the minimum happens before any transfer, so no balance moves.
+#[test]
+fn rejected_below_min_tip_leaves_all_balances_unchanged() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let token = token::Client::new(env, &s.token);
+    let token_admin = token::StellarAssetClient::new(env, &s.token);
+
+    let owner = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    let tipper = Address::generate(env);
+    token_admin.mint(&tipper, &1_000);
+
+    let jar_id = String::from_str(env, "@min-rejected");
+    client.create_jar(
+        &owner,
+        &jar_id,
+        &vec![
+            env,
+            Split {
+                to: alice.clone(),
+                bps: 6000,
+            },
+            Split {
+                to: bob.clone(),
+                bps: 4000,
+            },
+        ],
+    );
+    client.set_min_tip_amount(&jar_id, &Some(500_i128));
+
+    let alice_before = token.balance(&alice);
+    let bob_before = token.balance(&bob);
+    let tipper_before = token.balance(&tipper);
+
+    assert_eq!(
+        client.try_tip(&tipper, &jar_id, &499_i128, &String::from_str(env, "low")),
+        Err(Ok(Error::BelowMinTipAmount.into()))
+    );
+
+    assert_eq!(token.balance(&alice), alice_before);
+    assert_eq!(token.balance(&bob), bob_before);
+    assert_eq!(token.balance(&tipper), tipper_before);
 }
