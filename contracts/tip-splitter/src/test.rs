@@ -1,3 +1,5 @@
+Warning: truncated output (original token count: 56588)
+Total output lines: 7275
 Warning: truncated output (original token count: 56754)
 Total output lines: 7290
 
@@ -157,6 +159,14 @@ fn tip_splits_70_30() {
     assert_eq!(token.balance(&alice), 70);
     assert_eq!(token.balance(&bob), 30);
     assert_eq!(token.balance(&tipper), 900);
+}
+
+#[test]
+fn jar_exists_rejects_slugs_create_jar_would_reject() {
+    let s = setup();
+    let client = TipSplitterClient::new(&s.env, &s.contract);
+    assert!(!client.jar_exists(&String::from_str(&s.env, "")));
+    assert!(!client.jar_exists(&String::from_str(&s.env, &"x".repeat(65))));
 }
 
 #[test]
@@ -3361,6 +3371,28 @@ fn tip_enforces_minimum_tip_amount() {
     assert_eq!(res_low, Err(Ok(Error::BelowMinTipAmount.into())));
 
     // Tip at exact minimum (500) must succeed
+    let res_exact = client.try_tip(&tipper, &jar_id, &500_i128, &String::from_str(env, "exact"));
+    assert!(res_exact.is_ok());
+    assert_eq!(token.balance(&alice), 500);
+
+    // Tip above minimum (1000) must succeed
+    let res_above = client.try_tip(
+        &tipper,
+        &jar_id,
+        &1000_i128,
+        &String::from_str(env, "above"),
+    );
+    assert!(res_above.is_ok());
+    assert_eq!(token.balance(&alice), 1500);
+}
+
+#[test]
+fn preview_split_enforces_…6588 tokens truncated…ge contract asks this of arbitrary addresses.
+#[test]
+fn get_supporter_stats_is_zero_for_an_address_that_never_tipped() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
 …6754 tokens truncated…terClient::new(env, &s.contract);
     let token_admin = token::StellarAssetClient::new(env, &s.token);
 
