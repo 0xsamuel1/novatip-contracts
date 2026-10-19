@@ -113,6 +113,13 @@ pub struct Split {
     pub bps: u32,
 }
 
+/// Compact on-chain representation used by storage migrations. Tuple values
+/// have no repeated field labels, while the public `Split` remains readable
+/// for clients and events.
+#[contracttype]
+#[derive(Clone)]
+pub struct CompactSplit(pub Address, pub u32);
+
 /// A creator's tip jar: who controls it and how tips are split.
 #[contracttype]
 #[derive(Clone)]
@@ -317,6 +324,16 @@ pub enum Error {
     /// `collect_recurring` found the supporter's allowance for this contract
     /// too small to cover the scheduled amount. Checked before any transfer.
     InsufficientAllowance = 24,
+    /// The caller supplied zero where a positive amount is required.
+    AmountZero = 25,
+    /// The caller supplied a negative amount.
+    AmountNegative = 26,
+    /// The amount cannot produce a non-zero share for every recipient.
+    SplitAmountTooSmall = 27,
+    /// The amount multiplication exceeded the contract's integer range.
+    AmountOverflow = 28,
+    /// A configured minimum tip must be positive.
+    InvalidMinimumAmount = 29,
 }
 
 /// The interface a post-tip hook contract must implement (#176).
@@ -737,7 +754,7 @@ impl TipSplitter {
         match min_amount {
             Some(amount) => {
                 if amount <= 0 {
-                    panic_with_error!(&env, Error::InvalidAmount);
+                    panic_with_error!(&env, Error::InvalidMinimumAmount);
                 }
                 env.storage().persistent().set(&min_key, &amount);
                 env.storage()
@@ -915,8 +932,9 @@ impl TipSplitter {
         enforce_min: bool,
         reference: Option<BytesN<32>>,
     ) -> u64 {
-        if amount <= 0 {
-            panic_with_error!(env, Error::InvalidAmount);
+        if amount == 0 { panic_with_error!(env, Error::AmountZero); }
+        if amount < 0 {
+            panic_with_error!(env, Error::AmountNegative);
         }
         if message.len() > MAX_MESSAGE_LEN {
             panic_with_error!(env, Error::MessageTooLong);
@@ -1316,8 +1334,9 @@ impl TipSplitter {
         if period_ledgers == 0 {
             panic_with_error!(&env, Error::InvalidPeriod);
         }
-        if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
+        if amount == 0 { panic_with_error!(&env, Error::AmountZero); }
+        if amount < 0 {
+            panic_with_error!(&env, Error::AmountNegative);
         }
         if message.len() > MAX_MESSAGE_LEN {
             panic_with_error!(&env, Error::MessageTooLong);
@@ -1718,8 +1737,9 @@ impl TipSplitter {
         // Same precedence as `settle_tip`: an unusable amount is refused before
         // the jar lookup, so a client gets the identical error from preview
         // and from the tip itself.
-        if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
+        if amount == 0 { panic_with_error!(&env, Error::AmountZero); }
+        if amount < 0 {
+            panic_with_error!(&env, Error::AmountNegative);
         }
         let key = DataKey::Jar(jar_id.clone());
         let jar: Jar = env
@@ -1765,6 +1785,25 @@ impl TipSplitter {
                 .extend_ttl(&min_key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
         }
         min_amount
+    }
+
+    /// Return the smallest positive tip that can pay every configured split.
+    /// The result also respects the jar's optional minimum tip amount.
+    pub fn get_min_accepted_tip(env: Env, jar_id: String) -> i128 {
+        let key = DataKey::Jar(jar_id.clone());
+        let jar: Jar = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JarNotFound));
+        env.storage().persistent().extend_ttl(&key, JAR_TTL_THRESHOLD, JAR_TTL_LEDGERS);
+        let mut smallest = 1i128;
+        for i in 0..jar.splits.len() {
+            let bps = jar.splits.get(i).unwrap().bps as i128;
+            let required = (BPS_DENOM as i128 + bps - 1) / bps;
+            if required > smallest { smallest = required; }
+        }
+        if let Some(minimum) = env.storage().persistent().get::<DataKey, i128>(&DataKey::MinTip(jar_id)) {
+            if minimum > smallest { smallest = minimum; }
+        }
+        smallest
     }
 
     /// A jar's running tip totals, as settled on-chain.
@@ -2001,8 +2040,11 @@ impl TipSplitter {
     /// enough that some recipient's share would truncate to zero, or if it is
     /// so large that `amount * bps` overflows `i128`.
     fn compute_shares(env: &Env, splits: &Vec<Split>, amount: i128) -> Vec<i128> {
-        if amount <= 0 {
-            panic_with_error!(env, Error::InvalidAmount);
+        if amount == 0 {
+            panic_with_error!(env, Error::AmountZero);
+        }
+        if amount < 0 {
+            panic_with_error!(env, Error::AmountNegative);
         }
         let n = splits.len();
         let denom = BPS_DENOM as i128;
@@ -2021,9 +2063,9 @@ impl TipSplitter {
             // surfaces as a typed error rather than an opaque wasm trap.
             let product = amount
                 .checked_mul(bps)
-                .unwrap_or_else(|| panic_with_error!(env, Error::InvalidAmount));
+                .unwrap_or_else(|| panic_with_error!(env, Error::AmountOverflow));
             if product < denom {
-                panic_with_error!(env, Error::InvalidAmount);
+                panic_with_error!(env, Error::SplitAmountTooSmall);
             }
         }
 
@@ -2037,7 +2079,7 @@ impl TipSplitter {
             } else {
                 amount
                     .checked_mul(splits.get(i).unwrap().bps as i128)
-                    .unwrap_or_else(|| panic_with_error!(env, Error::InvalidAmount))
+                    .unwrap_or_else(|| panic_with_error!(env, Error::AmountOverflow))
                     / denom
             };
             distributed += share;
