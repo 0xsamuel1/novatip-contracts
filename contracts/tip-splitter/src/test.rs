@@ -1,5 +1,7 @@
 Warning: truncated output (original token count: 56588)
 Total output lines: 7275
+Warning: truncated output (original token count: 56754)
+Total output lines: 7290
 
 #![cfg(test)]
 use super::*;
@@ -1762,16 +1764,16 @@ fn preview_split_rejects_amounts_tip_would_reject() {
 
     assert_eq!(
         client.try_preview_split(&jar_id, &0),
-        Err(Ok(Error::InvalidAmount.into()))
+        Err(Ok(Error::AmountZero.into()))
     );
     assert_eq!(
         client.try_preview_split(&jar_id, &-5),
-        Err(Ok(Error::InvalidAmount.into()))
+        Err(Ok(Error::AmountNegative.into()))
     );
     // bps 100 truncates to zero below 100, which `tip` refuses to pay.
     assert_eq!(
         client.try_preview_split(&jar_id, &99),
-        Err(Ok(Error::InvalidAmount.into()))
+        Err(Ok(Error::SplitAmountTooSmall.into()))
     );
     assert!(client
         .try_tip(
@@ -1883,7 +1885,7 @@ fn tip_rejects_nonpositive_amount() {
     client.create_jar(&owner, &jar_id, &splits);
 
     let res = client.try_tip(&tipper, &jar_id, &0, &String::from_str(env, ""));
-    assert_eq!(res, Err(Ok(Error::InvalidAmount.into())));
+    assert_eq!(res, Err(Ok(Error::AmountZero.into())));
 }
 
 /// An over-long message is rejected before any funds move — the guard sits
@@ -3191,6 +3193,24 @@ fn set_min_tip_amount_sets_and_reads_minimum() {
 }
 
 #[test]
+fn get_min_accepted_tip_accounts_for_rounding_and_configured_minimum() {
+    let s = setup();
+    let env = &s.env;
+    let client = TipSplitterClient::new(env, &s.contract);
+    let owner = Address::generate(env);
+    let jar_id = String::from_str(env, "@smallest");
+    client.create_jar(&owner, &jar_id, &vec![env,
+        Split { to: Address::generate(env), bps: 7500 },
+        Split { to: Address::generate(env), bps: 2500 },
+    ]);
+    // ceil(10_000 / 2_500) is 4; this is the first amount where both
+    // non-final shares are positive under integer division.
+    assert_eq!(client.get_min_accepted_tip(&jar_id), 4);
+    client.set_min_tip_amount(&jar_id, &Some(25));
+    assert_eq!(client.get_min_accepted_tip(&jar_id), 25);
+}
+
+#[test]
 fn set_min_tip_amount_emits_event() {
     let s = setup();
     let env = &s.env;
@@ -3289,10 +3309,10 @@ fn set_min_tip_amount_rejects_non_positive_amount() {
     );
 
     let res_zero = client.try_set_min_tip_amount(&jar_id, &Some(0_i128));
-    assert_eq!(res_zero, Err(Ok(Error::InvalidAmount.into())));
+    assert_eq!(res_zero, Err(Ok(Error::InvalidMinimumAmount.into())));
 
     let res_neg = client.try_set_min_tip_amount(&jar_id, &Some(-50_i128));
-    assert_eq!(res_neg, Err(Ok(Error::InvalidAmount.into())));
+    assert_eq!(res_neg, Err(Ok(Error::InvalidMinimumAmount.into())));
 }
 
 #[test]
@@ -3373,6 +3393,7 @@ fn get_supporter_stats_is_zero_for_an_address_that_never_tipped() {
     let s = setup();
     let env = &s.env;
     let client = TipSplitterClient::new(env, &s.contract);
+…6754 tokens truncated…terClient::new(env, &s.contract);
     let token_admin = token::StellarAssetClient::new(env, &s.token);
 
     let owner = Address::generate(env);
@@ -4779,11 +4800,11 @@ fn preview_tip_rejects_what_tip_rejects() {
     );
     assert_eq!(
         client.try_preview_tip(&jar_id, &tipper, &0_i128),
-        Err(Ok(Error::InvalidAmount.into()))
+        Err(Ok(Error::AmountZero.into()))
     );
     assert_eq!(
         client.try_preview_tip(&jar_id, &tipper, &-5_i128),
-        Err(Ok(Error::InvalidAmount.into()))
+        Err(Ok(Error::AmountNegative.into()))
     );
     assert!(client.try_preview_tip(&jar_id, &tipper, &500_i128).is_ok());
 }
@@ -5675,6 +5696,11 @@ fn error_codes_are_pinned_to_the_public_interface() {
         (Error::InsufficientBalance, 22),
         (Error::NotDue, 23),
         (Error::InsufficientAllowance, 24),
+        (Error::AmountZero, 25),
+        (Error::AmountNegative, 26),
+        (Error::SplitAmountTooSmall, 27),
+        (Error::AmountOverflow, 28),
+        (Error::InvalidMinimumAmount, 29),
     ];
 
     for (variant, expected) in codes {
